@@ -320,14 +320,14 @@ export function formatWatchlistAnnouncement(wl, { isUpdate = false, test = false
   const d = new Date(`${wl.date}T00:00:00Z`);
   const wd = "日一二三四五六"[d.getUTCDay()];
   const md = `${d.getUTCMonth() + 1}/${d.getUTCDate()}（${wd}）`;
-  const head = `${test ? "🧪 測試推播（不啟動監控）\n" : ""}📋 ${md}當沖監控清單${isUpdate ? "（更新）" : ""}`;
+  const head = `${test ? "🧪 測試推播\n" : ""}📋 ${md}當沖監控清單${isUpdate ? "（更新）" : ""}`;
   const crit = wl.criteria?.length
     ? ["", "🔎 選股條件", ...wl.criteria.map((c, i) => `${"①②③④⑤⑥⑦⑧⑨⑩"[i]} ${c}`)]
     : [];
   if (!wl.items.length) {
     return [head, `今日沒有符合條件的當沖標的，不啟動盤中監控。${wl.noPickReason ? `\n原因：${wl.noPickReason}` : ""}`, ...crit].join("\n");
   }
-  const lines = [head, `共 ${wl.items.length} 檔，09:01 起自動監控，條件成立會另行通知。`, ...crit];
+  const lines = [head, test ? `共 ${wl.items.length} 檔（測試，不會啟動盤中監控）。` : `共 ${wl.items.length} 檔，09:01 起自動監控，條件成立會另行通知。`, ...crit];
   wl.items.forEach((it, i) => {
     const tag = it.tier === "secondary" ? "【⚠️ 次級觀察，部位減半】" : "";
     lines.push("", `${i + 1}) ${it.symbol} ${it.name}`.trim() + `${tag}｜昨收 ${fmt(it.prevClose)}｜失效價 ${fmt(it.invalidBelow)}`);
