@@ -54,14 +54,14 @@ globalThis.fetch = async (url) => {
   }
   if (u.pathname.includes("/intraday/quote/")) {
     return new Response(JSON.stringify({
-      date: "2026-10-20", symbol: sym, name: sym === "IX0001" ? undefined : "測試股",
+      date: "2026-10-17", symbol: sym, name: sym === "IX0001" ? undefined : "測試股",
       openPrice: 101, highPrice: 103, lowPrice: 100, lastPrice: 102, previousClose: 100,
       change: 2, changePercent: 2, total: { tradeVolume: 12345, tradeValue: 1.2e9 },
       limitUpPrice: 110, limitDownPrice: 90, lastUpdated: 1760923800000000,
     }));
   }
   if (u.pathname.includes("/intraday/candles/")) {
-    return new Response(JSON.stringify({ symbol: sym, date: "2026-10-20",
+    return new Response(JSON.stringify({ symbol: sym, date: "2026-10-17",
       data: [{ date: "2026-10-20T09:00:00.000+08:00", open: 101, high: 102, low: 100, close: 101.5, volume: 800, average: 101.2 }] }));
   }
   if (u.pathname.includes("/historical/candles/")) {
@@ -104,7 +104,16 @@ check("ticker 失敗仍回報價", q2.quotes[1].lastPrice === 102 && q2.quotes[1
 const c = await call({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "get_intraday_candles", arguments: { symbol: "2330" } } });
 check("get_intraday_candles", JSON.parse(c.body.result.content[0].text).count === 1);
 const h = await call({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "get_daily_history", arguments: { symbol: "2330", days: 5 } } });
-check("get_daily_history 新到舊", JSON.parse(h.body.result.content[0].text).candles[0].date === "2026-10-17");
+const hd = JSON.parse(h.body.result.content[0].text);
+check("get_daily_history 新到舊", hd.candles[0].date === "2026-10-17");
+check("日 K 成交量 股→張", hd.candles[0].volume === 20 && hd.candles[1].volume === 18);
+check("振幅 ÷ 前一日收盤", hd.candles[0].amplitudePercent === 4.08 && hd.candles[0].changePercent === 2.04);
+check("最舊一天無前收 → null", hd.candles[1].amplitudePercent === null);
+check("includesToday 欄位", hd.includesToday === false && hd.latestDate === "2026-10-17");
+const ci = JSON.parse((await call({ jsonrpc: "2.0", id: 41, method: "tools/call", params: { name: "get_intraday_candles", arguments: { symbol: "IX0001" } } })).body.result.content[0].text);
+check("指數分 K 改回傳 tradeValue", ci.candles[0].tradeValue === 800 && ci.candles[0].volume === undefined);
+check("過期分 K 有 note", ci.isToday === false && /不是今天/.test(ci.note));
+check("報價 isToday 與 note", qd.quotes[0].isToday === false && /不是今天/.test(qd.note));
 const o = await call({ jsonrpc: "2.0", id: 6, method: "tools/call", params: { name: "get_market_overview", arguments: {} } });
 check("get_market_overview", JSON.parse(o.body.result.content[0].text).quotes.length === 2);
 

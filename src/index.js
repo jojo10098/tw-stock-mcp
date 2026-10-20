@@ -14,7 +14,7 @@
 const FUGLE_BASE = "https://api.fugle.tw/marketdata/v1.0/stock";
 const TWSE_BASE = "https://openapi.twse.com.tw/v1";
 const TWSE_CACHE_SECONDS = 600; // 證交所資料一天更新一次，快取 10 分鐘足夠
-const SERVER_INFO = { name: "tw-stock-mcp", version: "0.2.1" };
+const SERVER_INFO = { name: "tw-stock-mcp", version: "0.3.0" };
 const SUPPORTED_PROTOCOLS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
 const INDEX_SYMBOLS = {
@@ -30,7 +30,7 @@ const TOOLS = [
   {
     name: "get_quotes",
     description:
-      "查詢台股個股或指數的即時報價（盤中，上市上櫃都支援）。一次最多 10 檔。回傳開盤價、最新成交價、最高、最低、昨收（參考價）、漲跌、漲跌幅、開盤跳空幅度、累計成交量、最佳五檔、漲跌停價、距漲停／跌停 %、是否觸及漲跌停；個股另附當天的可否現沖（canDayTrade）、只能先買後賣、平盤下可否融券、是否注意股、是否處置股、撮合循環秒數。資料時間為台北時間。指數代號：IX0001 加權指數、IX0043 櫃買指數。額度：每檔每次 1 次，個股當天第一次查詢多 1 次（漲跌停資料快取一整天）。",
+      "查詢台股個股或指數的即時報價（上市上櫃都支援），一次最多 10 檔。回傳開盤價、最新成交價、最高、最低、昨收、漲跌、漲跌幅、開盤跳空幅度（openGapPercent）、均價、累計成交張數（tradeVolume，單位：張）、成交金額（元）、最佳五檔、漲跌停價、距漲停／跌停 %、是否觸及漲跌停；個股另附當天的可否現沖（canDayTrade）、只能先買後賣（canBuyFirstDayTradeOnly）、平盤下可否融券、注意股（isAttention）、處置股（isDisposition）、撮合循環秒數（matchingIntervalSeconds，非 0 代表分盤撮合）。時段：盤中為即時資料；開盤前（09:00 前）或休市日查詢會回傳最近一個交易日的收盤資料，請以每檔的 isToday／date 判斷，不要把它當成今天的價格。指數代號：IX0001 加權指數、IX0043 櫃買指數（指數沒有漲跌停）。額度：每檔 1 次，個股當天第一次查詢多 1 次（漲跌停等資料快取一整天）。",
     inputSchema: {
       type: "object",
       properties: {
@@ -48,7 +48,7 @@ const TOOLS = [
   {
     name: "get_intraday_candles",
     description:
-      "查詢單一個股今日盤中的分時 K 線（開高低收量），用來判斷開盤後的走勢、量能是否放大、是否站上或跌破某價位。",
+      "查詢單一個股或指數今日盤中的分時 K 線（上市上櫃都支援），用來判斷開盤後的走勢、量能是否放大、是否站上或跌破某價位。個股 volume 單位為「張」；指數改回傳 tradeValue（成交金額，元）。時段：開盤前或休市日會回傳最近一個交易日的分 K，請看 isToday 判斷。額度 1 次。",
     inputSchema: {
       type: "object",
       properties: {
@@ -65,13 +65,13 @@ const TOOLS = [
   {
     name: "get_market_overview",
     description:
-      "一次查詢大盤背景：加權指數（IX0001）與櫃買指數（IX0043）的即時點數、漲跌、漲跌幅與資料時間。",
+      "一次查詢大盤背景：加權指數（IX0001）與櫃買指數（IX0043）的即時點數、漲跌、漲跌幅、成交金額與資料時間。開盤前查詢回傳的是最近一個交易日收盤（看 isToday）。額度 2 次。",
     inputSchema: { type: "object", properties: {} },
   },
   {
     name: "get_daily_history",
     description:
-      "查詢個股最近 N 個交易日的日 K（開高低收量），可用來計算近 5 日均量、振幅、前高前低，或和今日盤中量做比較。",
+      "查詢個股或指數最近 N 個交易日的日 K（上市上櫃都支援），新到舊排序（candles[0] 為最近一個交易日）。每天回傳開高低收、成交張數（volume，單位：張，已由股換算）、漲跌幅（changePercent），以及已算好的振幅（amplitudePercent ＝（最高 − 最低）÷ 前一日收盤），不需要自行換算。可用來計算均線、近 N 日均量、前高前低。時段：盤後約 16:30 才會更新當天資料，盤中查詢通常只到前一個交易日（看 includesToday）。額度 1 次（歷史行情另計，每分鐘 60 次）。",
     inputSchema: {
       type: "object",
       properties: {
@@ -89,7 +89,7 @@ const TOOLS = [
   {
     name: "get_valuation",
     description:
-      "【證交所 OpenAPI，上市股票，不吃富果額度】查詢個股最新的本益比、殖利率（%）、股價淨值比，資料為最近一個交易日盤後公布。一次最多 30 檔。",
+      "【證交所 OpenAPI，僅上市股票，不吃富果額度】查詢個股最新的本益比、殖利率（%）、股價淨值比，資料為證交所最近一個交易日盤後公布（回傳 date）。虧損或無盈餘時本益比為 null。上櫃股票會回傳查無資料。一次最多 30 檔。",
     inputSchema: {
       type: "object",
       properties: {
@@ -107,7 +107,7 @@ const TOOLS = [
   {
     name: "get_margin_trading",
     description:
-      "【證交所 OpenAPI，上市股票，不吃富果額度】查詢個股最近一個交易日的融資融券：融資買賣、餘額與增減、融券買賣、餘額與增減、券資比、資券互抵（單位：張）。用來判斷散戶槓桿與軋空潛力。一次最多 30 檔。",
+      "【證交所 OpenAPI，僅上市股票，不吃富果額度】查詢個股最近一個交易日的融資融券（單位：張）：融資買賣、餘額與增減、融資使用率、融券買賣、餘額與增減、券資比、資券互抵。用來判斷散戶槓桿與軋空潛力。只有個股資料，沒有全市場彙總。上櫃股票或非信用交易標的會回傳查無資料。一次最多 30 檔。",
     inputSchema: {
       type: "object",
       properties: {
@@ -125,7 +125,7 @@ const TOOLS = [
   {
     name: "get_daytrade_status",
     description:
-      "【證交所 OpenAPI，上市股票，不吃富果額度】當沖前檢查：個股是否為可當沖標的、是否暫停「先賣後買」、今天是否被列為注意股、是否在處置期間（含處置原因、期間與措施，例如人工撮合、預收款券）。一次最多 30 檔。",
+      "【證交所 OpenAPI，僅上市股票，不吃富果額度】當沖前檢查（依證交所最新公布、通常為前一交易日盤後的名單）：個股是否為可當沖標的（canDayTrade）、是否暫停「先賣後買」（sellFirstSuspended）、是否被列為注意股（isAttention）、是否在處置期間（isDisposed，含處置原因、期間與措施，例如人工撮合、預收款券），並彙整成 warnings。上櫃股票不在證交所名單中，請改看 get_quotes 回傳的 canDayTrade／isAttention／isDisposition。一次最多 30 檔。",
     inputSchema: {
       type: "object",
       properties: {
@@ -143,7 +143,7 @@ const TOOLS = [
   {
     name: "get_alert_lists",
     description:
-      "【證交所 OpenAPI，上市股票，不吃富果額度】列出證交所最新公布的全部注意股與處置股，用來避開被處置的標的或找出異常熱門股。",
+      "【證交所 OpenAPI，僅上市股票，不吃富果額度】列出證交所最新公布的全部注意股（含原因）與處置股（含處置期間與措施），用來避開被處置的標的或找出異常熱門股。不含上櫃股票。",
     inputSchema: { type: "object", properties: {} },
   },
 ];
@@ -336,7 +336,17 @@ async function getQuotes(env, args) {
       }
     })
   );
-  return { source: "富果 Fugle MarketData API", quotes: results };
+  const today = taipeiToday();
+  for (const q of results) {
+    if (!q.error) q.isToday = q.date === today;
+  }
+  const stale = results.some((q) => !q.error && q.date && q.date !== today);
+  return {
+    source: "富果 Fugle MarketData API",
+    unit: "tradeVolume 為成交張數；tradeValue 為成交金額（元）",
+    ...(stale ? { note: `部分報價的 date 不是今天（${today}）：今天可能尚未開盤或休市，這些是最近一個交易日的收盤資料` } : {}),
+    quotes: results,
+  };
 }
 
 async function getIntradayCandles(env, args) {
@@ -344,22 +354,28 @@ async function getIntradayCandles(env, args) {
   if (!symbol) throw new Error("symbol 不可為空");
   const timeframe = args?.timeframe ?? "5";
   const r = await fugle(env, `/intraday/candles/${encodeURIComponent(symbol)}`, { timeframe });
+  const isIndex = /^IX\d+$/.test(symbol);
+  // 富果分 K：個股 volume 為「張」；指數的 volume 欄位其實是成交金額（元）
   const candles = (r.data || []).map((c) => ({
     time: c.date,
     open: c.open,
     high: c.high,
     low: c.low,
     close: c.close,
-    volume: c.volume,
+    ...(isIndex ? { tradeValue: c.volume ?? null } : { volume: c.volume ?? null }),
     average: c.average,
   }));
+  const today = taipeiToday();
   return {
     source: "富果 Fugle MarketData API",
     symbol: r.symbol ?? symbol,
     date: r.date,
+    isToday: r.date === today,
     timeframe: `${timeframe} 分`,
+    unit: isIndex ? "tradeValue 為成交金額（元）" : "volume 為成交張數",
     count: candles.length,
     candles,
+    ...(r.date && r.date !== today ? { note: `這是 ${r.date} 的資料，不是今天（${today}）；今天可能尚未開盤或休市` } : {}),
   };
 }
 
@@ -380,20 +396,35 @@ async function getDailyHistory(env, args) {
     to: fmt(to),
     timeframe: "D",
   });
-  const rows = (r.data || [])
-    .slice()
-    .sort((a, b) => (a.date < b.date ? 1 : -1))
-    .slice(0, days)
-    .map((c) => ({
+  // 新到舊；多保留一天，用來算最舊那天的振幅（需要前一日收盤）
+  const sorted = (r.data || []).slice().sort((a, b) => (a.date < b.date ? 1 : -1));
+  const rows = sorted.slice(0, days).map((c, i) => {
+    const prevClose = sorted[i + 1]?.close ?? null;
+    return {
       date: c.date,
       open: c.open,
       high: c.high,
       low: c.low,
       close: c.close,
-      volume: c.volume,
-      amplitudePercent: pct(c.high, c.low),
-    }));
-  return { source: "富果 Fugle MarketData API", symbol: r.symbol ?? symbol, days: rows.length, candles: rows };
+      // 富果日 K 的 volume 是「股」，統一換算成「張」（1 張 = 1,000 股）
+      volume: c.volume == null ? null : Math.round(c.volume / 1000),
+      changePercent: pct(c.close, prevClose),
+      // 台股慣例：振幅 =（最高 − 最低）÷ 前一日收盤
+      amplitudePercent:
+        prevClose && c.high != null && c.low != null ? Math.round(((c.high - c.low) / prevClose) * 10000) / 100 : null,
+    };
+  });
+  const today = taipeiToday();
+  return {
+    source: "富果 Fugle MarketData API",
+    symbol: r.symbol ?? symbol,
+    unit: "volume 為成交張數（已由股換算）",
+    order: "新到舊（candles[0] 為最近一個交易日）",
+    latestDate: rows[0]?.date ?? null,
+    includesToday: rows[0]?.date === today,
+    days: rows.length,
+    candles: rows,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -650,7 +681,7 @@ async function handleRpc(env, msg) {
         capabilities: { tools: { listChanged: false } },
         serverInfo: SERVER_INFO,
         instructions:
-          "台股行情。盤中即時（富果 API，每分鐘 60 次額度）：查價用 get_quotes；大盤背景用 get_market_overview；開盤後走勢與量能用 get_intraday_candles；近幾日量價用 get_daily_history。盤後資料（證交所 OpenAPI，僅上市股票，不吃富果額度）：當沖前先用 get_daytrade_status 確認可否當沖、是否注意／處置；籌碼用 get_margin_trading；估值用 get_valuation；全部注意／處置股用 get_alert_lists。所有時間為台北時間，成交量單位為張。",
+          "台股行情。富果 API（上市上櫃皆可，每分鐘 60 次額度）：查價、漲跌停與可否現沖用 get_quotes；大盤背景用 get_market_overview；開盤後走勢與量能用 get_intraday_candles；近 N 日量價、振幅、均線用 get_daily_history。證交所 OpenAPI（前一交易日盤後資料，僅上市股票，不吃富果額度）：當沖前先用 get_daytrade_status 確認可否當沖、是否注意／處置；個股融資融券用 get_margin_trading；估值用 get_valuation；全部注意／處置股用 get_alert_lists。注意時段：開盤前或休市日，盤中工具回傳的是最近一個交易日資料，請看 isToday／date。所有工具的個股成交量單位一律為「張」，成交金額為「元」；所有時間為台北時間。",
       });
     }
     case "ping":
