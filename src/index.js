@@ -326,8 +326,11 @@ function json(body, status = 200, extra = {}) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    // 記錄每個請求（不含 token），可在 Cloudflare 後台 Logs 查看
+    const safePath = url.pathname.replace(/^\/(mcp|selftest)\/[^/]+/, "/$1/***");
+    console.log(JSON.stringify({ method: request.method, path: safePath, ua: request.headers.get("user-agent") }));
 
-    if (url.pathname === "/" || url.pathname === "/health") {
+    if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
       return json({ ok: true, server: SERVER_INFO });
     }
 
@@ -362,7 +365,12 @@ export default {
     }
 
     const m = url.pathname.match(/^\/mcp\/([^/]+)\/?$/);
-    if (!m) return json({ error: "Not found" }, 404);
+    if (!m) {
+      if (request.method === "POST") {
+        return json(rpcError(null, -32001, "網址錯誤：連接器網址必須是 /mcp/<MCP_TOKEN>"), 404);
+      }
+      return json({ error: "Not found" }, 404);
+    }
     if (!env.MCP_TOKEN || env.MCP_TOKEN.length < 16) {
       return json({ error: "Server misconfigured: MCP_TOKEN 未設定或太短（至少 16 字元）" }, 500);
     }
@@ -384,6 +392,8 @@ export default {
     let body;
     try {
       body = await request.json();
+      const methods = (Array.isArray(body) ? body : [body]).map((b) => b?.method);
+      console.log(JSON.stringify({ rpc: methods, protocol: body?.params?.protocolVersion }));
     } catch {
       return json(rpcError(null, -32700, "Parse error"), 400);
     }
