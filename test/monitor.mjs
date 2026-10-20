@@ -172,9 +172,10 @@ Date.now = () => at("06:05").getTime();
 const lastArgs = {
     date: "2026-10-21",
     items: [
-      { symbol: "2409", name: "友達", prevClose: 20, invalidBelow: 19.5, note: "量縮不追", entries: [{ id: "fl", when: "flat", label: "開平突破 20.3", priceAbove: 20.3, holdMinutes: 2 }, { id: "hi", when: "high", label: "開高站穩 20.5", priceAbove: 20.5, holdMinutes: 3, minVolumeRatio: 1.3, abandonBelow: 20.2 }] },
-      { symbol: "2002", name: "中鋼", prevClose: 22, invalidBelow: 21.6, entries: [{ id: "fl", when: "flat", label: "開平突破 22.2", priceAbove: 22.2 }] },
-    ] };
+      { symbol: "2409", name: "友達", prevClose: 20, invalidBelow: 19.5, note: "量縮不追", reason: "面板報價 10 月下旬翻揚（集邦 10/20），前一日爆量 2.1 倍", checks: ["收盤 20.0 ✅", "成交金額第 18 名 ✅", "5 日均振幅 3.4% ✅", "當沖比 32% ✅"], entries: [{ id: "fl", when: "flat", label: "開平突破 20.3", priceAbove: 20.3, holdMinutes: 2 }, { id: "hi", when: "high", label: "開高站穩 20.5", priceAbove: 20.5, holdMinutes: 3, minVolumeRatio: 1.3, abandonBelow: 20.2 }] },
+      { symbol: "2002", name: "中鋼", prevClose: 22, invalidBelow: 21.6, tier: "secondary", checks: ["當沖比 56% ⚠️ 超標"], entries: [{ id: "fl", when: "flat", label: "開平突破 22.2", priceAbove: 22.2 }] },
+    ],
+    criteria: ["前一日收盤 ≤ 250 元", "成交金額前 50 名", "近 5 日平均振幅 ≥ 3%", "當沖比 20%–50%", "有明確催化", "排除處置／注意／不可當沖"] };
 const setRes = await worker.fetch(new Request(`https://x.dev/mcp/${TOKEN}`, { method: "POST", body: JSON.stringify({
   jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "set_daytrade_watchlist", arguments: {
     date: "2026-10-21",
@@ -192,6 +193,8 @@ console.log("---- 公告預覽 ----\n" + sent[0].text + "\n------------------");
 {
   const again = await (await worker.fetch(new Request(`https://x.dev/mcp/${TOKEN}`, { method: "POST", body: JSON.stringify({
     jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "set_daytrade_watchlist", arguments: JSON.parse(JSON.stringify({ ...lastArgs })) } }) }), env)).json();
+  check("推播含選股條件、入選理由、檢核、次級標記", sent[1].text.includes("🔎 選股條件") && sent[1].text.includes("① 前一日收盤 ≤ 250 元") && sent[1].text.includes("入選理由：面板報價") && sent[1].text.includes("條件檢核：收盤 20.0 ✅｜") && sent[1].text.includes("次級觀察"));
+  console.log("---- 公告預覽（完整） ----\n" + sent[1].text + "\n------------------");
   check("同一天重寫 → 標示更新", sent.length === 2 && sent[1].text.includes("（更新）") && !again.result.isError);
   await worker.fetch(new Request(`https://x.dev/mcp/${TOKEN}`, { method: "POST", body: JSON.stringify({
     jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "set_daytrade_watchlist", arguments: { ...lastArgs, announce: false } } }) }), env);

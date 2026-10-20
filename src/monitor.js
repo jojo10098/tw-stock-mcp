@@ -143,6 +143,11 @@ function posNum(v, field) {
   return n;
 }
 
+function strList(v, maxItems, maxLen) {
+  if (!Array.isArray(v)) return [];
+  return v.map((x) => String(x ?? "").trim()).filter(Boolean).slice(0, maxItems).map((x) => x.slice(0, maxLen));
+}
+
 export function validateWatchlist(input) {
   const date = String(input?.date ?? "");
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error("date 必須是 YYYY-MM-DD（台北日期）");
@@ -165,6 +170,9 @@ export function validateWatchlist(input) {
       prevClose: posNum(it?.prevClose, `${symbol}.prevClose`),
       invalidBelow: posNum(it?.invalidBelow, `${symbol}.invalidBelow`),
       note: it?.note ? String(it.note).slice(0, 200) : undefined,
+      reason: it?.reason ? String(it.reason).slice(0, 200) : undefined,
+      checks: strList(it?.checks, 8, 60),
+      tier: it?.tier === "secondary" ? "secondary" : "main",
       entries: entries.map((e, j) => {
         const id = String(e?.id ?? `e${j + 1}`);
         if (ids.has(id)) throw new Error(`${symbol} 的條件 id 重複：${id}`);
@@ -186,7 +194,14 @@ export function validateWatchlist(input) {
       }),
     };
   });
-  return { date, noNewEntryAfter, items: out, setAt: new Date().toISOString() };
+  return {
+    date,
+    noNewEntryAfter,
+    criteria: strList(input?.criteria, 10, 80),
+    noPickReason: input?.noPickReason ? String(input.noPickReason).slice(0, 200) : undefined,
+    items: out,
+    setAt: new Date().toISOString(),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -306,12 +321,18 @@ export function formatWatchlistAnnouncement(wl, { isUpdate = false } = {}) {
   const wd = "日一二三四五六"[d.getUTCDay()];
   const md = `${d.getUTCMonth() + 1}/${d.getUTCDate()}（${wd}）`;
   const head = `📋 ${md}當沖監控清單${isUpdate ? "（更新）" : ""}`;
+  const crit = wl.criteria?.length
+    ? ["", "🔎 選股條件", ...wl.criteria.map((c, i) => `${"①②③④⑤⑥⑦⑧⑨⑩"[i]} ${c}`)]
+    : [];
   if (!wl.items.length) {
-    return `${head}\n今日沒有符合條件的當沖標的，不啟動盤中監控。`;
+    return [head, `今日沒有符合條件的當沖標的，不啟動盤中監控。${wl.noPickReason ? `\n原因：${wl.noPickReason}` : ""}`, ...crit].join("\n");
   }
-  const lines = [head, `共 ${wl.items.length} 檔，09:01 起自動監控，條件成立會另行通知。`];
+  const lines = [head, `共 ${wl.items.length} 檔，09:01 起自動監控，條件成立會另行通知。`, ...crit];
   wl.items.forEach((it, i) => {
-    lines.push("", `${i + 1}) ${it.symbol} ${it.name}`.trim() + `｜昨收 ${fmt(it.prevClose)}｜失效價 ${fmt(it.invalidBelow)}`);
+    const tag = it.tier === "secondary" ? "【⚠️ 次級觀察，部位減半】" : "";
+    lines.push("", `${i + 1}) ${it.symbol} ${it.name}`.trim() + `${tag}｜昨收 ${fmt(it.prevClose)}｜失效價 ${fmt(it.invalidBelow)}`);
+    if (it.reason) lines.push(`  入選理由：${it.reason}`);
+    if (it.checks?.length) lines.push(`  條件檢核：${it.checks.join("｜")}`);
     for (const e of it.entries) {
       const cond = [`≥ ${fmt(e.priceAbove)}`, e.holdMinutes > 1 ? `連續 ${e.holdMinutes} 分鐘` : null, e.minVolumeRatio ? `量比 ≥ ${e.minVolumeRatio}` : null]
         .filter(Boolean).join("、");
@@ -326,7 +347,8 @@ export function formatWatchlistAnnouncement(wl, { isUpdate = false } = {}) {
     if (it.note) lines.push(`  備註：${it.note}`);
   });
   lines.push("", `${wl.noNewEntryAfter} 後不發新進場通知；有部位 13:20 前平倉。`, "⚠️ 這是條件監控清單，不是買賣建議。");
-  return lines.join("\n");
+  const text = lines.join("\n");
+  return text.length > 4000 ? text.slice(0, 3990) + "\n…（過長截斷）" : text; // Telegram 單則上限 4096 字
 }
 
 // ---------------------------------------------------------------------------
