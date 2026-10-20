@@ -18,7 +18,7 @@ import { WatchMonitor, validateWatchlist, kvPut, runMonitorTick, watchStatus, se
 
 export { WatchMonitor };
 
-const SERVER_INFO = { name: "tw-stock-mcp", version: "0.4.0" };
+const SERVER_INFO = { name: "tw-stock-mcp", version: "0.4.1" };
 const SUPPORTED_PROTOCOLS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
 const INDEX_SYMBOLS = {
@@ -153,7 +153,7 @@ const TOOLS = [
   {
     name: "set_daytrade_watchlist",
     description:
-      "【盤中監控】寫入今天的當沖監控清單（覆蓋前一份）。寫入後，伺服器會在台北時間 09:01–13:25 每分鐘查一次即時報價，條件成立時用 Telegram 通知使用者；每個條件只通知一次。最多 5 檔。每檔包含：symbol、name、prevClose（前一日收盤）、invalidBelow（失效價：現價跌到此價以下就通知失效並停止監控該檔）、entries（進場條件陣列）。每個 entry：id、label（給人看的一句話，例如「開平突破 1,270」）、when（適用開盤情境：high=跳空 +1% 以上／flat=±1% 以內／low=跳空 -1% 以下／any）、priceAbove（觸發價：現價 ≥ 此價才算成立）、holdMinutes（需連續成立幾分鐘，預設 1，建議 2–3 以減少假突破）、minVolumeRatio（選填：累計成交量 ÷ 近 5 日均量同時段的線性估算值，需 ≥ 此倍數）、abandonBelow（選填：該劇本的放棄價，例如開高走低跌破某價就放棄）。另可設 noNewEntryAfter（HH:MM，預設 12:30，之後不再發進場通知）。開盤後若個股變成處置、分盤撮合或不可當沖，會自動通知失效。",
+      "【盤中監控】寫入今天的當沖監控清單（覆蓋前一份）。寫入後，伺服器會在台北時間 09:01–13:25 每分鐘查一次即時報價，條件成立時用 Telegram 通知使用者；每個條件只通知一次。最多 5 檔。每檔包含：symbol、name、prevClose（前一日收盤）、invalidBelow（失效價：現價跌到此價以下就通知失效並停止監控該檔）、entries（進場條件陣列）。每個 entry：id、label（給人看的一句話，例如「開平突破 1,270」）、when（適用開盤情境：high=跳空 +1% 以上／flat=±1% 以內／low=跳空 -1% 以下／any）、priceAbove（觸發價：現價 ≥ 此價才算成立）、holdMinutes（需連續成立幾分鐘，預設 1，建議 2–3 以減少假突破）、minVolumeRatio（選填：今日累計成交量 ÷ 近 5 日「同一時刻」的平均累計量（依實際分時量能分布，已反映開盤爆量），需 ≥ 此倍數；建議 1.3）、abandonBelow（選填：該劇本的放棄價，例如開高走低跌破某價就放棄）。另可設 noNewEntryAfter（HH:MM，預設 12:30，之後不再發進場通知）。開盤後若個股變成處置、分盤撮合或不可當沖，會自動通知失效。",
     inputSchema: {
       type: "object",
       properties: {
@@ -436,6 +436,24 @@ async function getIntradayCandles(env, args) {
 
 async function getMarketOverview(env) {
   return getQuotes(env, { symbols: Object.keys(INDEX_SYMBOLS) });
+}
+
+/**
+ * 監控用：取最近約 10 個日曆日的 1 分 K（不含今天），用來建立分時量能曲線。
+ * 富果分 K 的 volume 上市櫃為「張」；date 為 ISO 時間（+08:00）。不是 MCP 工具。
+ */
+async function getMinuteHistory(env, { symbol, today }) {
+  const sym = normalizeSymbol(symbol ?? "");
+  if (!sym) throw new Error("symbol 不可為空");
+  const end = new Date(`${today}T00:00:00+08:00`);
+  const fmt = (d) => new Date(d.getTime() + 8 * 3600 * 1000).toISOString().slice(0, 10);
+  const r = await fugle(env, `/historical/candles/${encodeURIComponent(sym)}`, {
+    from: fmt(new Date(end.getTime() - 10 * 86400 * 1000)),
+    to: fmt(new Date(end.getTime() - 86400 * 1000)),
+    timeframe: "1",
+    fields: "volume",
+  });
+  return { candles: r.data || [] };
 }
 
 async function getDailyHistory(env, args) {
@@ -808,7 +826,7 @@ function json(body, status = 200, extra = {}) {
 export default {
   async scheduled(event, env, ctx) {
     ctx.waitUntil(
-      runMonitorTick(env, new Date(event.scheduledTime), { getQuotes, getDailyHistory })
+      runMonitorTick(env, new Date(event.scheduledTime), { getQuotes, getDailyHistory, getMinuteHistory })
         .then((r) => console.log(JSON.stringify({ monitor: r })))
         .catch((e) => console.log(JSON.stringify({ monitorError: e.message })))
     );

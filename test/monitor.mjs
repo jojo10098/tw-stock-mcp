@@ -2,7 +2,7 @@
 import worker from "../src/index.js";
 import {
   WatchMonitor, validateWatchlist, evaluateItem, newSymbolState, exitLevels, tickSize,
-  scenarioOf, runMonitorTick, watchStatus, taipeiParts,
+  scenarioOf, runMonitorTick, watchStatus, taipeiParts, buildVolumeProfile, expectedVolume, formatEvent,
 } from "../src/monitor.js";
 
 let failed = 0;
@@ -91,6 +91,45 @@ check("清單驗證通過、預設值", wl.items.length === 2 && wl.noNewEntryAf
   check("非今日報價 → 不判斷", ev3.length === 0);
 }
 
+// ---------- 分時量能曲線 ----------
+// 模擬「開盤爆量」：09:00 那一分鐘 3000 張，之後每分鐘 100 張，13:30 收盤集合 1000 張
+const mkDay = (day, scale = 1) => {
+  const rows = [];
+  for (let m = 540; m <= 810; m++) {
+    const hh = String(Math.floor(m / 60)).padStart(2, "0"), mm = String(m % 60).padStart(2, "0");
+    if (m > 805 && m < 810) continue; // 13:26–13:29 無成交
+    const v = m === 540 ? 3000 : m === 810 ? 1000 : 100;
+    rows.push({ date: `${day}T${hh}:${mm}:00.000+08:00`, volume: v * scale });
+  }
+  return rows;
+};
+{
+  const candles = [...mkDay("2026-10-14"), ...mkDay("2026-10-15"), ...mkDay("2026-10-16", 2), ...mkDay("2026-10-19"), ...mkDay("2026-10-20"), ...mkDay("2026-10-21", 9)];
+  const p = buildVolumeProfile(candles, "2026-10-21", 5);
+  check("曲線：排除今天、取最近 5 天", p.method === "profile" && p.days === 5 && !p.dates.includes("2026-10-21"));
+  // 平均：4 天 ×1 + 1 天 ×2 → 1.2 倍
+  // 09:01 檢查：只含 09:00 那根 = 3000×1.2 = 3600
+  check("09:01 預期量已含開盤爆量（3600 張）", expectedVolume(p, 541) === 3600);
+  // 09:31：09:00 + 30 根 100 = 6000 ×1.2 = 7200
+  check("09:31 預期量 7200 張", expectedVolume(p, 571) === 7200);
+  const lin = { method: "linear", avgVol5: p.cum.at(-1) };
+  check("同一天的開盤時段，線性估算明顯偏低", expectedVolume(lin, 541) < expectedVolume(p, 541) / 10);
+  check("分 K 不足 3 天 → null", buildVolumeProfile(mkDay("2026-10-20"), "2026-10-21") === null);
+  check("無資料 → null", buildVolumeProfile([], "2026-10-21") === null && expectedVolume(null, 600) === null);
+
+  // 量比判斷：09:01 累計 3000 張，對曲線（3600）只有 0.83 倍 → 不成立；線性會誤判為大爆量
+  const it = validateWatchlist({ date: "2026-10-21", items: [{ symbol: "2409", entries: [{ id: "fl", when: "flat", priceAbove: 20, minVolumeRatio: 1.3 }] }] }).items[0];
+  const q = (vol) => ({ lastPrice: 20.1, tradeVolume: vol, openGapPercent: 0, isToday: true, canDayTrade: true, matchingIntervalSeconds: 0 });
+  let ev = evaluateItem(it, q(3000), newSymbolState(), { minute: 541, hhmm: "09:01", noNewEntryMin: 750, volBase: p });
+  check("開盤正常爆量（0.83 倍）→ 依分時曲線不成立", ev.length === 0);
+  ev = evaluateItem(it, q(3000), newSymbolState(), { minute: 541, hhmm: "09:01", noNewEntryMin: 750, volBase: lin });
+  check("同樣的量用線性估算會誤判成立（舊行為）", ev.length === 1);
+  ev = evaluateItem(it, q(5000), newSymbolState(), { minute: 541, hhmm: "09:01", noNewEntryMin: 750, volBase: p });
+  check("真的放量（1.4 倍）→ 成立，並標示依分時", ev.length === 1 && ev[0].volMethod === "profile" && ev[0].volDays === 5);
+  const txt = formatEvent({ symbol: "2409", name: "友達" }, { tradeVolume: 5000, changePercent: 0.5 }, ev[0], "09:01");
+  check("通知文字說明量比基準", txt.includes("近 5 日同時段實際累計量") && txt.includes("1.4 倍"));
+}
+
 // ---------- 端到端：模擬一個交易日 ----------
 const store = new Map();
 const monitor = new WatchMonitor({ storage: {
@@ -111,7 +150,14 @@ const deps = {
     return { quotes: symbols.map((s) => ({ symbol: s, name: s, lastPrice: prices[s], tradeVolume: 50000, openGapPercent: gap[s], changePercent: 1.0, isToday: true, canDayTrade: true, matchingIntervalSeconds: 0 })) };
   },
   getDailyHistory: async (_env, { symbol }) => ({ candles: [{ date: "2026-10-20", volume: 54000 }, { date: "2026-10-19", volume: 54000 }] }),
+  // 友達有分 K；中鋼模擬富果 404 → 退回線性估算
+  getMinuteHistory: async (_env, { symbol, today }) => {
+    minuteCalls++;
+    if (symbol === "2002") throw new Error("404");
+    return { candles: [...mkDay("2026-10-16"), ...mkDay("2026-10-19"), ...mkDay("2026-10-20")] };
+  },
 };
+let minuteCalls = 0;
 globalThis.fetch = async (url, init) => {
   if (String(url).startsWith("https://api.telegram.org/")) {
     sent.push(JSON.parse(init.body));
@@ -163,6 +209,8 @@ check("13:26 之後不執行", (await runMonitorTick(env, at("13:26"), deps)).sk
 
 Date.now = () => at("13:20").getTime();
 const status = await watchStatus(env, at("13:20"));
+check("量能基準：友達用分時曲線、中鋼退回線性", /實際分時/.test(status.items[0].volumeBaseline) && /線性/.test(status.items[1].volumeBaseline));
+check("分 K 每天每檔只查一次", minuteCalls === 2);
 check("watchStatus 狀態正確", status.activeToday && status.items[0].entries[0].status.startsWith("已觸發 09:07") && status.items[1].invalidated && status.notifications.length === 4);
 const getRes = await (await worker.fetch(new Request(`https://x.dev/mcp/${TOKEN}`, { method: "POST", body: JSON.stringify({
   jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "get_daytrade_watchlist", arguments: {} } }) }), env)).json();

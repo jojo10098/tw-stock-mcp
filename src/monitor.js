@@ -71,6 +71,68 @@ export function scenarioOf(openGapPercent) {
 const SCENARIO_LABEL = { high: "開高", flat: "開平", low: "開低", any: "任何開盤" };
 
 // ---------------------------------------------------------------------------
+// 量能基準：依近幾日「實際分時累計量」估算同時段的正常量
+// ---------------------------------------------------------------------------
+
+const PROFILE_MIN_DAYS = 3; // 分 K 至少要有 3 天，否則退回線性估算
+
+/**
+ * 由近幾個交易日的 1 分 K 建立「同時段平均累計量」曲線。
+ * cum[k] = 這幾天在 09:00+k 分「之前」（不含該分鐘）累計成交量的平均（張）。
+ * 盤中第 M 分鐘檢查時，今天的累計量涵蓋到 M 分，與 cum[M-09:00] 時間對齊。
+ * @param candles 富果 1 分 K：{ date: "2026-10-20T09:00:00.000+08:00", volume }（上市櫃單位為張）
+ * @param today   台北日期 YYYY-MM-DD，今天的資料會排除
+ * @param maxDays 最多取幾天（最近的）
+ */
+export function buildVolumeProfile(candles, today, maxDays = 5) {
+  const byDay = new Map();
+  for (const c of candles || []) {
+    const d = String(c?.date ?? "");
+    const m = d.match(/^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})/);
+    if (!m || m[1] >= today || c.volume == null) continue;
+    const minute = Number(m[2]) * 60 + Number(m[3]);
+    if (!byDay.has(m[1])) byDay.set(m[1], []);
+    byDay.get(m[1]).push([minute, Number(c.volume)]);
+  }
+  const days = [...byDay.keys()].sort().reverse().slice(0, maxDays);
+  if (days.length < PROFILE_MIN_DAYS) return null;
+  const size = SESSION_MINUTES + 2; // k = 0..271，最後一格含 13:30 收盤集合競價
+  const cum = new Array(size).fill(0);
+  for (const day of days) {
+    const perMin = new Array(size).fill(0);
+    for (const [minute, vol] of byDay.get(day)) {
+      const k = minute - OPEN_MIN;
+      if (k >= 0 && k < size - 1) perMin[k + 1] += vol; // 該分鐘的量計入「下一分鐘之前」
+    }
+    let run = 0;
+    for (let k = 0; k < size; k++) {
+      run += perMin[k];
+      cum[k] += run;
+    }
+  }
+  return {
+    method: "profile",
+    days: days.length,
+    dates: days,
+    cum: cum.map((v) => Math.round(v / days.length)),
+  };
+}
+
+/** 某分鐘的「正常累計量」（張）；無法估算時回傳 null */
+export function expectedVolume(base, minute) {
+  if (!base) return null;
+  const k = Math.min(Math.max(minute - OPEN_MIN, 1), SESSION_MINUTES + 1);
+  if (base.method === "profile") {
+    const v = base.cum?.[k];
+    return v > 0 ? v : null;
+  }
+  if (base.method === "linear" && base.avgVol5) {
+    return (base.avgVol5 * Math.min(k, SESSION_MINUTES)) / SESSION_MINUTES;
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // 清單驗證
 // ---------------------------------------------------------------------------
 
@@ -139,7 +201,7 @@ export function newSymbolState() {
  * @param item   清單中的一檔
  * @param quote  get_quotes 的單檔結果
  * @param st     該檔狀態（會被修改）
- * @param ctx    { minute, hhmm, noNewEntryMin, avgVol5 }
+ * @param ctx    { minute, hhmm, noNewEntryMin, volBase }（volBase 來自 buildVolumeProfile 或 {method:"linear",avgVol5}）
  * @returns 事件陣列：{ type: "entry"|"invalid"|"abandon", ... }
  */
 export function evaluateItem(item, quote, st, ctx) {
@@ -168,8 +230,12 @@ export function evaluateItem(item, quote, st, ctx) {
 
   const scenario = scenarioOf(quote.openGapPercent);
   if (!scenario) return events;
-  const expectedVol = ctx.avgVol5 ? (ctx.avgVol5 * Math.min(Math.max(ctx.minute - OPEN_MIN, 1), SESSION_MINUTES)) / SESSION_MINUTES : null;
+  // 量能基準：優先用分時曲線（ctx.volBase），舊呼叫方式 ctx.avgVol5 視為線性
+  const volBase = ctx.volBase ?? (ctx.avgVol5 ? { method: "linear", avgVol5: ctx.avgVol5 } : null);
+  const expectedVol = expectedVolume(volBase, ctx.minute);
   const volRatio = expectedVol && quote.tradeVolume != null ? quote.tradeVolume / expectedVol : null;
+  const volMethod = volBase?.method ?? null;
+  const volDays = volBase?.days ?? null;
 
   for (const e of item.entries) {
     if (e.when !== "any" && e.when !== scenario) continue;
@@ -192,7 +258,7 @@ export function evaluateItem(item, quote, st, ctx) {
     if (st.holdSince[e.id] == null) st.holdSince[e.id] = ctx.minute;
     if (ctx.minute - st.holdSince[e.id] + 1 >= e.holdMinutes) {
       st.fired[e.id] = { at: ctx.hhmm, price };
-      events.push({ type: "entry", entry: e, price, scenario, volRatio, levels: exitLevels(price) });
+      events.push({ type: "entry", entry: e, price, scenario, volRatio, volMethod, volDays, levels: exitLevels(price) });
     }
   }
   return events;
@@ -210,9 +276,10 @@ export function formatEvent(item, quote, ev, hhmm) {
   if (ev.type === "entry") {
     const lot = Math.round(ev.price * 1000);
     const loss = Math.round((ev.price - ev.levels.stop) * 1000);
+    const how = ev.volMethod === "profile" ? `近 ${ev.volDays} 日同時段實際累計量` : "近 5 日均量線性估算";
     const vol =
       ev.volRatio != null
-        ? `量能：累計 ${fmt(quote.tradeVolume)} 張，約近 5 日同時段 ${ev.volRatio.toFixed(1)} 倍（線性估算）`
+        ? `量能：累計 ${fmt(quote.tradeVolume)} 張，為${how}的 ${ev.volRatio.toFixed(1)} 倍`
         : `量能：累計 ${fmt(quote?.tradeVolume)} 張`;
     return [
       `🟢 當沖條件成立｜${title}`,
@@ -312,20 +379,33 @@ export async function runMonitorTick(env, now, deps) {
   const wl = await kvGet(env, "watchlist");
   if (!wl || wl.date !== t.date || !wl.items?.length) return { skipped: "no_watchlist_today", date: t.date };
 
-  const state = (await kvGet(env, `state:${t.date}`)) ?? { symbols: {}, avgVol5: {}, reminded: false, sent: [] };
+  const state = (await kvGet(env, `state:${t.date}`)) ?? { symbols: {}, reminded: false, sent: [] };
+  state.volBase ??= {};
   const active = wl.items.filter((it) => !state.symbols[it.symbol]?.invalidated);
 
-  // 近 5 日均量：每天每檔只查一次
+  // 量能基準：每天每檔只建一次。優先用近 5 日 1 分 K 的實際分時累計量；
+  // 分 K 取不到或不足 3 天時，退回「近 5 日均量 × 經過時間比例」的線性估算。
   for (const it of active) {
-    if (state.avgVol5[it.symbol] === undefined) {
+    if (state.volBase[it.symbol] !== undefined) continue;
+    let base = null;
+    if (deps.getMinuteHistory) {
+      try {
+        const r = await deps.getMinuteHistory(env, { symbol: it.symbol, today: t.date });
+        base = buildVolumeProfile(r?.candles, t.date, 5);
+      } catch {
+        base = null;
+      }
+    }
+    if (!base) {
       try {
         const h = await deps.getDailyHistory(env, { symbol: it.symbol, days: 5 });
         const vols = (h.candles || []).filter((c) => c.date < t.date).map((c) => c.volume).filter((v) => v != null);
-        state.avgVol5[it.symbol] = vols.length ? vols.reduce((a, b) => a + b, 0) / vols.length : null;
+        base = vols.length ? { method: "linear", days: vols.length, avgVol5: vols.reduce((a, b) => a + b, 0) / vols.length } : null;
       } catch {
-        state.avgVol5[it.symbol] = null;
+        base = null;
       }
     }
+    state.volBase[it.symbol] = base;
   }
 
   const messages = [];
@@ -336,7 +416,7 @@ export async function runMonitorTick(env, now, deps) {
     for (const it of active) {
       const st = (state.symbols[it.symbol] ??= newSymbolState());
       const quote = bySym[it.symbol];
-      const events = evaluateItem(it, quote, st, { minute: t.minute, hhmm: t.hhmm, noNewEntryMin, avgVol5: state.avgVol5[it.symbol] });
+      const events = evaluateItem(it, quote, st, { minute: t.minute, hhmm: t.hhmm, noNewEntryMin, volBase: state.volBase[it.symbol] });
       for (const ev of events) {
         st.log.push({ at: t.hhmm, type: ev.type, id: ev.entry?.id ?? null, price: ev.price });
         messages.push(formatEvent(it, quote, ev, t.hhmm));
@@ -375,10 +455,18 @@ export async function watchStatus(env, now = new Date(Date.now())) {
     telegramConfigured: Boolean(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID),
     items: (wl?.items ?? []).map((it) => {
       const st = state?.symbols?.[it.symbol];
+      const vb = state?.volBase?.[it.symbol];
+      const expNow = expectedVolume(vb, t.minute);
       return {
         symbol: it.symbol,
         name: it.name,
         invalidBelow: it.invalidBelow,
+        volumeBaseline:
+          vb === undefined ? "尚未建立（開盤後第一次檢查時建立）"
+            : vb === null ? "無法取得歷史量，量能條件不會成立"
+              : vb.method === "profile" ? `近 ${vb.days} 日實際分時累計量（${vb.dates?.join("、")}）`
+                : `近 ${vb.days} 日均量線性估算（分 K 不足）`,
+        expectedVolumeNow: expNow == null ? null : Math.round(expNow),
         entries: it.entries.map((e) => ({
           id: e.id,
           label: e.label,
