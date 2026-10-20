@@ -316,11 +316,11 @@ export function formatEvent(item, quote, ev, hhmm) {
 }
 
 /** 晨報寫入清單後的「今日標的」公告 */
-export function formatWatchlistAnnouncement(wl, { isUpdate = false } = {}) {
+export function formatWatchlistAnnouncement(wl, { isUpdate = false, test = false } = {}) {
   const d = new Date(`${wl.date}T00:00:00Z`);
   const wd = "日一二三四五六"[d.getUTCDay()];
   const md = `${d.getUTCMonth() + 1}/${d.getUTCDate()}（${wd}）`;
-  const head = `📋 ${md}當沖監控清單${isUpdate ? "（更新）" : ""}`;
+  const head = `${test ? "🧪 測試推播（不啟動監控）\n" : ""}📋 ${md}當沖監控清單${isUpdate ? "（更新）" : ""}`;
   const crit = wl.criteria?.length
     ? ["", "🔎 選股條件", ...wl.criteria.map((c, i) => `${"①②③④⑤⑥⑦⑧⑨⑩"[i]} ${c}`)]
     : [];

@@ -254,6 +254,16 @@ check("/notify-test 送出測試訊息", nt.ok === true && sent.at(-1).text.incl
   const st = await (await worker.fetch(new Request(`https://x.dev/status`), { ...env, TELEGRAM_CHAT_ID: "42,-100" })).json();
   check("/status 顯示收件者數量", st.telegramRecipients === 2 || st.monitor?.telegramRecipients === 2 || JSON.stringify(st).includes('"telegramRecipients":2'));
 }
+{
+  const before = sent.length;
+  const wlB64 = Buffer.from(JSON.stringify({ date: "2026-10-20", criteria: ["成交金額前 50 名"], items: [{ symbol: "3037", name: "欣興", prevClose: 1120, invalidBelow: 1040, entries: [{ id: "flat", when: "flat", label: "開平突破 1,132", priceAbove: 1132, holdMinutes: 2 }] }] })).toString("base64url");
+  const r = await (await worker.fetch(new Request(`https://x.dev/announce-test/${TOKEN}?wl=${wlB64}`), env)).json();
+  check("/announce-test 依參數推播測試清單", r.ok === true && sent.length === before + 1 && sent.at(-1).text.startsWith("🧪 測試推播") && sent.at(-1).text.includes("3037 欣興"));
+  const wlNow = await (await worker.fetch(new Request(`https://x.dev/mcp/${TOKEN}`, { method: "POST", body: JSON.stringify({ jsonrpc: "2.0", id: 9, method: "tools/call", params: { name: "get_daytrade_watchlist", arguments: {} } }) }), env)).json();
+  check("/announce-test 不覆蓋監控清單", JSON.parse(wlNow.result.content[0].text).items.length === 2);
+  const bad = await (await worker.fetch(new Request(`https://x.dev/announce-test/wrong?wl=${wlB64}`), env)).json();
+  check("/announce-test 錯誤 token 拒絕", bad.ok === false && sent.length === before + 1);
+}
 check("/notify-test 錯誤 token 拒絕", (await (await worker.fetch(new Request(`https://x.dev/notify-test/wrong`), env)).json()).ok === false);
 const noTg = await runMonitorTick({ ...env, TELEGRAM_BOT_TOKEN: undefined }, at("13:00"), deps);
 check("未設定 Telegram 時不會出錯", noTg.ran === true);

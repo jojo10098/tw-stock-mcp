@@ -18,7 +18,7 @@ import { WatchMonitor, validateWatchlist, kvGet, kvPut, formatWatchlistAnnouncem
 
 export { WatchMonitor };
 
-const SERVER_INFO = { name: "tw-stock-mcp", version: "0.4.4" };
+const SERVER_INFO = { name: "tw-stock-mcp", version: "0.4.5" };
 const SUPPORTED_PROTOCOLS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
 const INDEX_SYMBOLS = {
@@ -850,7 +850,7 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     // 記錄每個請求（不含 token），可在 Cloudflare 後台 Logs 查看
-    const safePath = url.pathname.replace(/^\/(mcp|selftest|notify-test|watch)\/[^/]+/, "/$1/***");
+    const safePath = url.pathname.replace(/^\/(mcp|selftest|notify-test|announce-test|watch)\/[^/]+/, "/$1/***");
     console.log(JSON.stringify({ method: request.method, path: safePath, ua: request.headers.get("user-agent") }));
 
     if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
@@ -879,6 +879,31 @@ export default {
       }
       const r = await sendTelegram(env, `✅ tw-stock-mcp 通知測試成功（${taipeiParts().hhmm} 台北時間）\n之後當沖監控條件成立時，會在這裡通知你。`);
       return json(r);
+    }
+
+    // 推播預覽：/announce-test/<token>?wl=<base64url(JSON)>
+    // 只格式化並推播一份清單（標示「測試」），不寫入監控、不影響當日清單；不帶 wl 時重發目前儲存的清單
+    const at = url.pathname.match(/^\/announce-test\/([^/]+)\/?$/);
+    if (at) {
+      if (!env.MCP_TOKEN || !safeEqual(decodeURIComponent(at[1]), env.MCP_TOKEN)) {
+        return json({ ok: false, reason: "token 不符或 MCP_TOKEN 未設定" });
+      }
+      try {
+        let wl;
+        const raw = url.searchParams.get("wl");
+        if (raw) {
+          const b64 = raw.replace(/-/g, "+").replace(/_/g, "/");
+          const bytes = Uint8Array.from(atob(b64 + "===".slice((b64.length + 3) % 4)), (c) => c.charCodeAt(0));
+          wl = validateWatchlist(JSON.parse(new TextDecoder().decode(bytes)));
+        } else {
+          wl = env.MONITOR ? await kvGet(env, "watchlist") : null;
+          if (!wl) return json({ ok: false, reason: "目前沒有儲存的清單，請帶 wl 參數" });
+        }
+        const r = await sendTelegram(env, formatWatchlistAnnouncement(wl, { test: true }));
+        return json({ ...r, date: wl.date, items: wl.items.map((i) => i.symbol) });
+      } catch (e) {
+        return json({ ok: false, reason: `清單格式錯誤：${e.message}` });
+      }
     }
 
     // 監控狀態：帶正確 token 才回傳
