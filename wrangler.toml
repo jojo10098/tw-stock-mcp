@@ -27,4 +27,4 @@ crons = ["* 1-5 * * 1-5"]
 
 # 通知用 Secret（在 Cloudflare 後台新增）：
 #   TELEGRAM_BOT_TOKEN  Telegram Bot 的 token
-#   TELEGRAM_CHAT_ID    你的 Telegram chat id
+#   TELEGRAM_CHAT_ID    Telegram chat id，可填多個並以逗號分隔（例：個人 id,-100頻道 id）

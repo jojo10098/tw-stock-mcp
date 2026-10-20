@@ -36,7 +36,7 @@
 2. 部署完成後，到該 Worker 的 **Settings → Variables and Secrets**，新增兩個 **Secret**：
    - `FUGLE_API_KEY`：富果行情 API 金鑰
    - `MCP_TOKEN`：一串隨機字串（至少 16 字元）
-3. 盤中監控通知（選用）：再新增兩個 Secret：`TELEGRAM_BOT_TOKEN`、`TELEGRAM_CHAT_ID`，然後打開 `https://<worker 網址>/notify-test/<MCP_TOKEN>` 測試。
+3. 盤中監控通知（選用）：再新增兩個 Secret：`TELEGRAM_BOT_TOKEN`、`TELEGRAM_CHAT_ID`，然後打開 `https://<worker 網址>/notify-test/<MCP_TOKEN>` 測試。`TELEGRAM_CHAT_ID` 可填多個收件者，以逗號分隔，例如 `8656980423,-1004373470716`（個人私訊＋頻道）；頻道需先把 Bot 加為管理員並開啟「發布訊息」。
 4. 打開 `https://<worker 網址>/health`，看到 `{"ok":true,...}` 就是活著。
    打開 `https://<worker 網址>/selftest/<MCP_TOKEN>` 可同時檢查富果與證交所是否連得到。
 5. 連接器網址：`https://<worker 網址>/mcp/<MCP_TOKEN>`

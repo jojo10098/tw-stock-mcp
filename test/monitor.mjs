@@ -217,6 +217,23 @@ const getRes = await (await worker.fetch(new Request(`https://x.dev/mcp/${TOKEN}
 check("MCP get_daytrade_watchlist", JSON.parse(getRes.result.content[0].text).items.length === 2);
 const nt = await (await worker.fetch(new Request(`https://x.dev/notify-test/${TOKEN}`), env)).json();
 check("/notify-test 送出測試訊息", nt.ok === true && sent.at(-1).text.includes("通知測試成功"));
+{
+  const before = sent.length;
+  const multi = await (await worker.fetch(new Request(`https://x.dev/notify-test/${TOKEN}`), { ...env, TELEGRAM_CHAT_ID: "42, -1004373470716，42" })).json();
+  const ids = sent.slice(before).map((m) => m.chat_id);
+  check("多個 chat id：各發一次、自動去重", multi.ok === true && ids.length === 2 && ids.includes("42") && ids.includes("-1004373470716"));
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    const b = JSON.parse(init.body);
+    if (b.chat_id === "-1") return new Response(JSON.stringify({ ok: false, description: "Forbidden" }), { status: 403 });
+    return realFetch(url, init);
+  };
+  const part = await (await worker.fetch(new Request(`https://x.dev/notify-test/${TOKEN}`), { ...env, TELEGRAM_CHAT_ID: "42,-1" })).json();
+  check("其中一個失敗不影響其他，並回報哪個失敗", part.ok === false && sent.at(-1).chat_id === "42" && JSON.stringify(part).includes("-1"));
+  globalThis.fetch = realFetch;
+  const st = await (await worker.fetch(new Request(`https://x.dev/status`), { ...env, TELEGRAM_CHAT_ID: "42,-100" })).json();
+  check("/status 顯示收件者數量", st.telegramRecipients === 2 || st.monitor?.telegramRecipients === 2 || JSON.stringify(st).includes('"telegramRecipients":2'));
+}
 check("/notify-test 錯誤 token 拒絕", (await (await worker.fetch(new Request(`https://x.dev/notify-test/wrong`), env)).json()).ok === false);
 const noTg = await runMonitorTick({ ...env, TELEGRAM_BOT_TOKEN: undefined }, at("13:00"), deps);
 check("未設定 Telegram 時不會出錯", noTg.ran === true);

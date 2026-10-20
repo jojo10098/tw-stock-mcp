@@ -14,11 +14,11 @@
 const FUGLE_BASE = "https://api.fugle.tw/marketdata/v1.0/stock";
 const TWSE_BASE = "https://openapi.twse.com.tw/v1";
 const TWSE_CACHE_SECONDS = 600; // 證交所資料一天更新一次，快取 10 分鐘足夠
-import { WatchMonitor, validateWatchlist, kvPut, runMonitorTick, watchStatus, sendTelegram, taipeiParts } from "./monitor.js";
+import { WatchMonitor, validateWatchlist, kvPut, runMonitorTick, watchStatus, sendTelegram, taipeiParts, telegramChatIds } from "./monitor.js";
 
 export { WatchMonitor };
 
-const SERVER_INFO = { name: "tw-stock-mcp", version: "0.4.1" };
+const SERVER_INFO = { name: "tw-stock-mcp", version: "0.4.2" };
 const SUPPORTED_PROTOCOLS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
 const INDEX_SYMBOLS = {
@@ -850,6 +850,7 @@ export default {
         mcpTokenSet: Boolean(env.MCP_TOKEN),
         mcpTokenLongEnough: Boolean(env.MCP_TOKEN && env.MCP_TOKEN.length >= 16),
         telegramConfigured: Boolean(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID),
+        telegramRecipients: telegramChatIds(env).length,
         monitorBound: Boolean(env.MONITOR),
       });
     }

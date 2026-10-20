@@ -309,17 +309,36 @@ export async function sendTelegram(env, text) {
     console.log(JSON.stringify({ telegram: "not_configured", text: text.slice(0, 80) }));
     return { ok: false, reason: "未設定 TELEGRAM_BOT_TOKEN／TELEGRAM_CHAT_ID" };
   }
+  const chatIds = telegramChatIds(env);
+  if (!chatIds.length) return { ok: false, reason: "TELEGRAM_CHAT_ID 沒有有效的 id" };
+  // 多個收件者（私訊、頻道、群組）各自發送；一個失敗不影響其他
+  const results = await Promise.all(chatIds.map((id) => sendOne(env, id, text)));
+  const failed = results.filter((r) => !r.ok);
+  return {
+    ok: failed.length === 0,
+    sentTo: results.length - failed.length,
+    total: results.length,
+    reason: failed.length ? failed.map((r) => `${r.chatId}：${r.reason}`).join("；") : undefined,
+  };
+}
+
+/** TELEGRAM_CHAT_ID 可填多個，以逗號、分號或空白分隔；例：8656980423,-1004373470716 或 @頻道名稱 */
+export function telegramChatIds(env) {
+  return [...new Set(String(env.TELEGRAM_CHAT_ID ?? "").split(/[\s,;，、]+/).map((s) => s.trim()).filter(Boolean))];
+}
+
+async function sendOne(env, chatId, text) {
   try {
     const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, text, disable_web_page_preview: true }),
+      body: JSON.stringify({ chat_id: chatId, text, disable_web_page_preview: true }),
     });
     const body = await res.json().catch(() => ({}));
-    if (!res.ok || body.ok === false) return { ok: false, reason: `Telegram ${res.status}：${body.description ?? ""}` };
-    return { ok: true };
+    if (!res.ok || body.ok === false) return { ok: false, chatId, reason: `Telegram ${res.status}：${body.description ?? ""}` };
+    return { ok: true, chatId };
   } catch (e) {
-    return { ok: false, reason: `Telegram 連線失敗：${e.message}` };
+    return { ok: false, chatId, reason: `Telegram 連線失敗：${e.message}` };
   }
 }
 
