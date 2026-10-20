@@ -11,3 +11,20 @@ keep_vars = true
 
 [observability]
 enabled = true
+
+# 當沖盤中監控：狀態存在 SQLite 版 Durable Object（免費方案可用）
+[[durable_objects.bindings]]
+name = "MONITOR"
+class_name = "WatchMonitor"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WatchMonitor"]
+
+# 每分鐘執行；UTC 01:00–05:59 = 台北 09:00–13:59，平日。程式內再限縮到 09:01–13:25
+[triggers]
+crons = ["* 1-5 * * 1-5"]
+
+# 通知用 Secret（在 Cloudflare 後台新增）：
+#   TELEGRAM_BOT_TOKEN  Telegram Bot 的 token
+#   TELEGRAM_CHAT_ID    你的 Telegram chat id

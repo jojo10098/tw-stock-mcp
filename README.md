@@ -21,15 +21,25 @@
 | `get_valuation` | 本益比、殖利率、股價淨值比 |
 | `get_alert_lists` | 全部注意股與處置股清單 |
 
+盤中監控（當沖條件通知）：
+
+| 工具 | 用途 |
+|---|---|
+| `set_daytrade_watchlist` | 寫入當日當沖條件（最多 5 檔）；伺服器在台北 09:01–13:25 每分鐘檢查，成立時以 Telegram 通知 |
+| `get_daytrade_watchlist` | 查看清單、各條件狀態（監控中／已觸發／已放棄）與通知紀錄 |
+
+監控規則：每個條件只通知一次；可設「需連續成立幾分鐘」與量能倍數；跌破失效價、變成處置股、分盤撮合或不可當沖時通知失效並停止監控；12:30 後不再發進場通知；13:15 對已觸發標的發平倉提醒。
+
 ## 部署
 
 1. Cloudflare 後台 → **Workers & Pages** → **Create** → **Import a repository**，選這個 repo，其他設定用預設值。
 2. 部署完成後，到該 Worker 的 **Settings → Variables and Secrets**，新增兩個 **Secret**：
    - `FUGLE_API_KEY`：富果行情 API 金鑰
    - `MCP_TOKEN`：一串隨機字串（至少 16 字元）
-3. 打開 `https://<worker 網址>/health`，看到 `{"ok":true,...}` 就是活著。
+3. 盤中監控通知（選用）：再新增兩個 Secret：`TELEGRAM_BOT_TOKEN`、`TELEGRAM_CHAT_ID`，然後打開 `https://<worker 網址>/notify-test/<MCP_TOKEN>` 測試。
+4. 打開 `https://<worker 網址>/health`，看到 `{"ok":true,...}` 就是活著。
    打開 `https://<worker 網址>/selftest/<MCP_TOKEN>` 可同時檢查富果與證交所是否連得到。
-4. 連接器網址：`https://<worker 網址>/mcp/<MCP_TOKEN>`
+5. 連接器網址：`https://<worker 網址>/mcp/<MCP_TOKEN>`
 
 > 這個 repo 是公開的，所以程式碼裡**沒有任何金鑰**；兩個 Secret 只存在 Cloudflare。網址裡的 `MCP_TOKEN` 就是密碼，不要外流。
 

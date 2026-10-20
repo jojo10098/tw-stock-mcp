@@ -86,7 +86,7 @@ const init = await call({ jsonrpc: "2.0", id: 1, method: "initialize", params: {
 check("initialize", init.body.result?.serverInfo?.name === "tw-stock-mcp");
 check("notification → 202", (await call({ jsonrpc: "2.0", method: "notifications/initialized" })).status === 202);
 const list = await call({ jsonrpc: "2.0", id: 2, method: "tools/list" });
-check("tools/list 有 8 個工具", list.body.result.tools.length === 8);
+check("tools/list 有 10 個工具", list.body.result.tools.length === 10);
 const q = await call({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "get_quotes", arguments: { symbols: ["2330", "IX0001"] } } });
 const qd = JSON.parse(q.body.result.content[0].text);
 check("get_quotes 跳空 1%", qd.quotes[0].openGapPercent === 1);

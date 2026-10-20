@@ -14,7 +14,11 @@
 const FUGLE_BASE = "https://api.fugle.tw/marketdata/v1.0/stock";
 const TWSE_BASE = "https://openapi.twse.com.tw/v1";
 const TWSE_CACHE_SECONDS = 600; // 證交所資料一天更新一次，快取 10 分鐘足夠
-const SERVER_INFO = { name: "tw-stock-mcp", version: "0.3.0" };
+import { WatchMonitor, validateWatchlist, kvPut, runMonitorTick, watchStatus, sendTelegram, taipeiParts } from "./monitor.js";
+
+export { WatchMonitor };
+
+const SERVER_INFO = { name: "tw-stock-mcp", version: "0.4.0" };
 const SUPPORTED_PROTOCOLS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
 const INDEX_SYMBOLS = {
@@ -144,6 +148,57 @@ const TOOLS = [
     name: "get_alert_lists",
     description:
       "【證交所 OpenAPI，僅上市股票，不吃富果額度】列出證交所最新公布的全部注意股（含原因）與處置股（含處置期間與措施），用來避開被處置的標的或找出異常熱門股。不含上櫃股票。",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "set_daytrade_watchlist",
+    description:
+      "【盤中監控】寫入今天的當沖監控清單（覆蓋前一份）。寫入後，伺服器會在台北時間 09:01–13:25 每分鐘查一次即時報價，條件成立時用 Telegram 通知使用者；每個條件只通知一次。最多 5 檔。每檔包含：symbol、name、prevClose（前一日收盤）、invalidBelow（失效價：現價跌到此價以下就通知失效並停止監控該檔）、entries（進場條件陣列）。每個 entry：id、label（給人看的一句話，例如「開平突破 1,270」）、when（適用開盤情境：high=跳空 +1% 以上／flat=±1% 以內／low=跳空 -1% 以下／any）、priceAbove（觸發價：現價 ≥ 此價才算成立）、holdMinutes（需連續成立幾分鐘，預設 1，建議 2–3 以減少假突破）、minVolumeRatio（選填：累計成交量 ÷ 近 5 日均量同時段的線性估算值，需 ≥ 此倍數）、abandonBelow（選填：該劇本的放棄價，例如開高走低跌破某價就放棄）。另可設 noNewEntryAfter（HH:MM，預設 12:30，之後不再發進場通知）。開盤後若個股變成處置、分盤撮合或不可當沖，會自動通知失效。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        date: { type: "string", description: "台北日期 YYYY-MM-DD，必須是要監控的那一天" },
+        noNewEntryAfter: { type: "string", description: "HH:MM，預設 12:30" },
+        items: {
+          type: "array",
+          maxItems: 5,
+          items: {
+            type: "object",
+            properties: {
+              symbol: { type: "string" },
+              name: { type: "string" },
+              prevClose: { type: "number" },
+              invalidBelow: { type: "number" },
+              note: { type: "string" },
+              entries: {
+                type: "array",
+                minItems: 1,
+                items: {
+                  type: "object",
+                  properties: {
+                    id: { type: "string" },
+                    label: { type: "string" },
+                    when: { type: "string", enum: ["high", "flat", "low", "any"] },
+                    priceAbove: { type: "number" },
+                    holdMinutes: { type: "integer", minimum: 1, maximum: 30 },
+                    minVolumeRatio: { type: "number" },
+                    abandonBelow: { type: "number" },
+                  },
+                  required: ["when", "priceAbove"],
+                },
+              },
+            },
+            required: ["symbol", "entries"],
+          },
+        },
+      },
+      required: ["date", "items"],
+    },
+  },
+  {
+    name: "get_daytrade_watchlist",
+    description:
+      "【盤中監控】查看目前的當沖監控清單與今日狀態：每個條件是監控中、已觸發（時間與價格）或已放棄，哪些標的已失效，以及已送出的通知紀錄與 Telegram 是否設定完成。",
     inputSchema: { type: "object", properties: {} },
   },
 ];
@@ -642,6 +697,28 @@ async function getAlertLists() {
   };
 }
 
+async function setDaytradeWatchlist(env, args) {
+  if (!env.MONITOR) throw new Error("伺服器尚未設定 MONITOR（Durable Object）綁定");
+  const wl = validateWatchlist(args);
+  const today = taipeiParts().date;
+  if (wl.date < today) throw new Error(`date ${wl.date} 已經過去（今天是 ${today}）`);
+  await kvPut(env, "watchlist", wl);
+  await kvPut(env, `state:${wl.date}`, null);
+  return {
+    ok: true,
+    date: wl.date,
+    items: wl.items.map((it) => `${it.symbol} ${it.name}：${it.entries.length} 個條件，失效價 ${it.invalidBelow ?? "未設"}`),
+    noNewEntryAfter: wl.noNewEntryAfter,
+    telegramConfigured: Boolean(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID),
+    note: "監控時段為台北 09:01–13:25，每分鐘檢查一次；13:15 會對已觸發的標的發平倉提醒。",
+  };
+}
+
+async function getDaytradeWatchlist(env) {
+  if (!env.MONITOR) throw new Error("伺服器尚未設定 MONITOR（Durable Object）綁定");
+  return watchStatus(env);
+}
+
 const HANDLERS = {
   get_quotes: getQuotes,
   get_intraday_candles: getIntradayCandles,
@@ -651,6 +728,8 @@ const HANDLERS = {
   get_margin_trading: getMarginTrading,
   get_daytrade_status: getDaytradeStatus,
   get_alert_lists: getAlertLists,
+  set_daytrade_watchlist: setDaytradeWatchlist,
+  get_daytrade_watchlist: getDaytradeWatchlist,
 };
 
 // ---------------------------------------------------------------------------
@@ -681,7 +760,7 @@ async function handleRpc(env, msg) {
         capabilities: { tools: { listChanged: false } },
         serverInfo: SERVER_INFO,
         instructions:
-          "台股行情。富果 API（上市上櫃皆可，每分鐘 60 次額度）：查價、漲跌停與可否現沖用 get_quotes；大盤背景用 get_market_overview；開盤後走勢與量能用 get_intraday_candles；近 N 日量價、振幅、均線用 get_daily_history。證交所 OpenAPI（前一交易日盤後資料，僅上市股票，不吃富果額度）：當沖前先用 get_daytrade_status 確認可否當沖、是否注意／處置；個股融資融券用 get_margin_trading；估值用 get_valuation；全部注意／處置股用 get_alert_lists。注意時段：開盤前或休市日，盤中工具回傳的是最近一個交易日資料，請看 isToday／date。所有工具的個股成交量單位一律為「張」，成交金額為「元」；所有時間為台北時間。",
+          "台股行情。富果 API（上市上櫃皆可，每分鐘 60 次額度）：查價、漲跌停與可否現沖用 get_quotes；大盤背景用 get_market_overview；開盤後走勢與量能用 get_intraday_candles；近 N 日量價、振幅、均線用 get_daily_history。證交所 OpenAPI（前一交易日盤後資料，僅上市股票，不吃富果額度）：當沖前先用 get_daytrade_status 確認可否當沖、是否注意／處置；個股融資融券用 get_margin_trading；估值用 get_valuation；全部注意／處置股用 get_alert_lists。注意時段：開盤前或休市日，盤中工具回傳的是最近一個交易日資料，請看 isToday／date。盤中監控：set_daytrade_watchlist 寫入當日當沖條件後，伺服器每分鐘自動檢查並以 Telegram 通知；get_daytrade_watchlist 查看狀態。所有工具的個股成交量單位一律為「張」，成交金額為「元」；所有時間為台北時間。",
       });
     }
     case "ping":
@@ -727,10 +806,18 @@ function json(body, status = 200, extra = {}) {
 }
 
 export default {
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(
+      runMonitorTick(env, new Date(event.scheduledTime), { getQuotes, getDailyHistory })
+        .then((r) => console.log(JSON.stringify({ monitor: r })))
+        .catch((e) => console.log(JSON.stringify({ monitorError: e.message })))
+    );
+  },
+
   async fetch(request, env) {
     const url = new URL(request.url);
     // 記錄每個請求（不含 token），可在 Cloudflare 後台 Logs 查看
-    const safePath = url.pathname.replace(/^\/(mcp|selftest)\/[^/]+/, "/$1/***");
+    const safePath = url.pathname.replace(/^\/(mcp|selftest|notify-test|watch)\/[^/]+/, "/$1/***");
     console.log(JSON.stringify({ method: request.method, path: safePath, ua: request.headers.get("user-agent") }));
 
     if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
@@ -744,11 +831,32 @@ export default {
         fugleKeySet: Boolean(env.FUGLE_API_KEY),
         mcpTokenSet: Boolean(env.MCP_TOKEN),
         mcpTokenLongEnough: Boolean(env.MCP_TOKEN && env.MCP_TOKEN.length >= 16),
-        mcpTokenLength: env.MCP_TOKEN ? env.MCP_TOKEN.length : 0,
+        telegramConfigured: Boolean(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID),
+        monitorBound: Boolean(env.MONITOR),
       });
     }
 
     // 診斷：帶正確 token 才會實際呼叫富果一次
+    // 通知測試：帶正確 token 才會送一則 Telegram 測試訊息
+    const nt = url.pathname.match(/^\/notify-test\/([^/]+)\/?$/);
+    if (nt) {
+      if (!env.MCP_TOKEN || !safeEqual(decodeURIComponent(nt[1]), env.MCP_TOKEN)) {
+        return json({ ok: false, reason: "token 不符或 MCP_TOKEN 未設定" });
+      }
+      const r = await sendTelegram(env, `✅ tw-stock-mcp 通知測試成功（${taipeiParts().hhmm} 台北時間）\n之後當沖監控條件成立時，會在這裡通知你。`);
+      return json(r);
+    }
+
+    // 監控狀態：帶正確 token 才回傳
+    const wt = url.pathname.match(/^\/watch\/([^/]+)\/?$/);
+    if (wt) {
+      if (!env.MCP_TOKEN || !safeEqual(decodeURIComponent(wt[1]), env.MCP_TOKEN)) {
+        return json({ ok: false, reason: "token 不符或 MCP_TOKEN 未設定" });
+      }
+      if (!env.MONITOR) return json({ ok: false, reason: "MONITOR 未綁定" });
+      return json(await watchStatus(env));
+    }
+
     const st = url.pathname.match(/^\/selftest\/([^/]+)\/?$/);
     if (st) {
       if (!env.MCP_TOKEN || !safeEqual(decodeURIComponent(st[1]), env.MCP_TOKEN)) {
