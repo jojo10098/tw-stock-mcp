@@ -169,6 +169,12 @@ globalThis.fetch = async (url, init) => {
 // 先透過 MCP 寫入清單（測試 Worker 路由）
 const realNow = Date.now;
 Date.now = () => at("06:05").getTime();
+const lastArgs = {
+    date: "2026-10-21",
+    items: [
+      { symbol: "2409", name: "友達", prevClose: 20, invalidBelow: 19.5, note: "量縮不追", entries: [{ id: "fl", when: "flat", label: "開平突破 20.3", priceAbove: 20.3, holdMinutes: 2 }, { id: "hi", when: "high", label: "開高站穩 20.5", priceAbove: 20.5, holdMinutes: 3, minVolumeRatio: 1.3, abandonBelow: 20.2 }] },
+      { symbol: "2002", name: "中鋼", prevClose: 22, invalidBelow: 21.6, entries: [{ id: "fl", when: "flat", label: "開平突破 22.2", priceAbove: 22.2 }] },
+    ] };
 const setRes = await worker.fetch(new Request(`https://x.dev/mcp/${TOKEN}`, { method: "POST", body: JSON.stringify({
   jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "set_daytrade_watchlist", arguments: {
     date: "2026-10-21",
@@ -181,6 +187,17 @@ check("MCP set_daytrade_watchlist 成功", !setBody.result.isError && JSON.parse
 const pastRes = await (await worker.fetch(new Request(`https://x.dev/mcp/${TOKEN}`, { method: "POST", body: JSON.stringify({
   jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "set_daytrade_watchlist", arguments: { date: "2026-10-20", items: [] } } }) }), env)).json();
 check("寫入過去日期 → 錯誤", pastRes.result.isError === true);
+check("寫入後推播今日清單", sent.length === 1 && sent[0].text.startsWith("📋 10/21（三）當沖監控清單") && sent[0].text.includes("2409 友達") && sent[0].text.includes("失效價 19.5") && /已推播到 1 個/.test(setBody.result.content[0].text));
+console.log("---- 公告預覽 ----\n" + sent[0].text + "\n------------------");
+{
+  const again = await (await worker.fetch(new Request(`https://x.dev/mcp/${TOKEN}`, { method: "POST", body: JSON.stringify({
+    jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "set_daytrade_watchlist", arguments: JSON.parse(JSON.stringify({ ...lastArgs })) } }) }), env)).json();
+  check("同一天重寫 → 標示更新", sent.length === 2 && sent[1].text.includes("（更新）") && !again.result.isError);
+  await worker.fetch(new Request(`https://x.dev/mcp/${TOKEN}`, { method: "POST", body: JSON.stringify({
+    jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "set_daytrade_watchlist", arguments: { ...lastArgs, announce: false } } }) }), env);
+  check("announce=false 不推播", sent.length === 2);
+}
+sent.length = 0;
 Date.now = realNow;
 
 check("開盤前不執行", (await runMonitorTick(env, at("08:59"), deps)).skipped === "outside_session");

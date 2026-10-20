@@ -300,6 +300,35 @@ export function formatEvent(item, quote, ev, hhmm) {
   return "";
 }
 
+/** 晨報寫入清單後的「今日標的」公告 */
+export function formatWatchlistAnnouncement(wl, { isUpdate = false } = {}) {
+  const d = new Date(`${wl.date}T00:00:00Z`);
+  const wd = "日一二三四五六"[d.getUTCDay()];
+  const md = `${d.getUTCMonth() + 1}/${d.getUTCDate()}（${wd}）`;
+  const head = `📋 ${md}當沖監控清單${isUpdate ? "（更新）" : ""}`;
+  if (!wl.items.length) {
+    return `${head}\n今日沒有符合條件的當沖標的，不啟動盤中監控。`;
+  }
+  const lines = [head, `共 ${wl.items.length} 檔，09:01 起自動監控，條件成立會另行通知。`];
+  wl.items.forEach((it, i) => {
+    lines.push("", `${i + 1}) ${it.symbol} ${it.name}`.trim() + `｜昨收 ${fmt(it.prevClose)}｜失效價 ${fmt(it.invalidBelow)}`);
+    for (const e of it.entries) {
+      const cond = [`≥ ${fmt(e.priceAbove)}`, e.holdMinutes > 1 ? `連續 ${e.holdMinutes} 分鐘` : null, e.minVolumeRatio ? `量比 ≥ ${e.minVolumeRatio}` : null]
+        .filter(Boolean).join("、");
+      const ab = e.abandonBelow != null ? `；跌破 ${fmt(e.abandonBelow)} 放棄` : "";
+      lines.push(`  • ${SCENARIO_LABEL[e.when]}｜${e.label}（${cond}${ab}）`);
+    }
+    const p = it.entries[0]?.priceAbove;
+    if (p) {
+      const lv = exitLevels(p);
+      lines.push(`  1 張約 ${fmt(Math.round(p * 1000))} 元；依觸發價停損 ${fmt(lv.stop)}，約虧 ${fmt(Math.round((p - lv.stop) * 1000))} 元`);
+    }
+    if (it.note) lines.push(`  備註：${it.note}`);
+  });
+  lines.push("", `${wl.noNewEntryAfter} 後不發新進場通知；有部位 13:20 前平倉。`, "⚠️ 這是條件監控清單，不是買賣建議。");
+  return lines.join("\n");
+}
+
 // ---------------------------------------------------------------------------
 // Telegram
 // ---------------------------------------------------------------------------

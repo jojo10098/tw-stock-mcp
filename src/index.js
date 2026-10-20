@@ -14,11 +14,11 @@
 const FUGLE_BASE = "https://api.fugle.tw/marketdata/v1.0/stock";
 const TWSE_BASE = "https://openapi.twse.com.tw/v1";
 const TWSE_CACHE_SECONDS = 600; // 證交所資料一天更新一次，快取 10 分鐘足夠
-import { WatchMonitor, validateWatchlist, kvPut, runMonitorTick, watchStatus, sendTelegram, taipeiParts, telegramChatIds } from "./monitor.js";
+import { WatchMonitor, validateWatchlist, kvGet, kvPut, formatWatchlistAnnouncement, runMonitorTick, watchStatus, sendTelegram, taipeiParts, telegramChatIds } from "./monitor.js";
 
 export { WatchMonitor };
 
-const SERVER_INFO = { name: "tw-stock-mcp", version: "0.4.2" };
+const SERVER_INFO = { name: "tw-stock-mcp", version: "0.4.3" };
 const SUPPORTED_PROTOCOLS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
 const INDEX_SYMBOLS = {
@@ -153,12 +153,13 @@ const TOOLS = [
   {
     name: "set_daytrade_watchlist",
     description:
-      "【盤中監控】寫入今天的當沖監控清單（覆蓋前一份）。寫入後，伺服器會在台北時間 09:01–13:25 每分鐘查一次即時報價，條件成立時用 Telegram 通知使用者；每個條件只通知一次。最多 5 檔。每檔包含：symbol、name、prevClose（前一日收盤）、invalidBelow（失效價：現價跌到此價以下就通知失效並停止監控該檔）、entries（進場條件陣列）。每個 entry：id、label（給人看的一句話，例如「開平突破 1,270」）、when（適用開盤情境：high=跳空 +1% 以上／flat=±1% 以內／low=跳空 -1% 以下／any）、priceAbove（觸發價：現價 ≥ 此價才算成立）、holdMinutes（需連續成立幾分鐘，預設 1，建議 2–3 以減少假突破）、minVolumeRatio（選填：今日累計成交量 ÷ 近 5 日「同一時刻」的平均累計量（依實際分時量能分布，已反映開盤爆量），需 ≥ 此倍數；建議 1.3）、abandonBelow（選填：該劇本的放棄價，例如開高走低跌破某價就放棄）。另可設 noNewEntryAfter（HH:MM，預設 12:30，之後不再發進場通知）。開盤後若個股變成處置、分盤撮合或不可當沖，會自動通知失效。",
+      "【盤中監控】寫入今天的當沖監控清單（覆蓋前一份）。寫入後，伺服器會在台北時間 09:01–13:25 每分鐘查一次即時報價，條件成立時用 Telegram 通知使用者；每個條件只通知一次。最多 5 檔。每檔包含：symbol、name、prevClose（前一日收盤）、invalidBelow（失效價：現價跌到此價以下就通知失效並停止監控該檔）、entries（進場條件陣列）。每個 entry：id、label（給人看的一句話，例如「開平突破 1,270」）、when（適用開盤情境：high=跳空 +1% 以上／flat=±1% 以內／low=跳空 -1% 以下／any）、priceAbove（觸發價：現價 ≥ 此價才算成立）、holdMinutes（需連續成立幾分鐘，預設 1，建議 2–3 以減少假突破）、minVolumeRatio（選填：今日累計成交量 ÷ 近 5 日「同一時刻」的平均累計量（依實際分時量能分布，已反映開盤爆量），需 ≥ 此倍數；建議 1.3）、abandonBelow（選填：該劇本的放棄價，例如開高走低跌破某價就放棄）。另可設 noNewEntryAfter（HH:MM，預設 12:30，之後不再發進場通知）。開盤後若個股變成處置、分盤撮合或不可當沖，會自動通知失效。寫入成功後會立即把今日清單推播到 Telegram（同一天重寫會標示「更新」；items 為空時推播「今日無標的」）；不想推播可設 announce=false。",
     inputSchema: {
       type: "object",
       properties: {
         date: { type: "string", description: "台北日期 YYYY-MM-DD，必須是要監控的那一天" },
         noNewEntryAfter: { type: "string", description: "HH:MM，預設 12:30" },
+        announce: { type: "boolean", description: "寫入後是否推播今日清單到 Telegram，預設 true" },
         items: {
           type: "array",
           maxItems: 5,
@@ -720,10 +721,19 @@ async function setDaytradeWatchlist(env, args) {
   const wl = validateWatchlist(args);
   const today = taipeiParts().date;
   if (wl.date < today) throw new Error(`date ${wl.date} 已經過去（今天是 ${today}）`);
+  const prev = await kvGet(env, "watchlist");
   await kvPut(env, "watchlist", wl);
   await kvPut(env, `state:${wl.date}`, null);
+
+  // 寫入後把今日清單推播到 Telegram（私訊／頻道）；同一天再次寫入會標示「更新」
+  let announced = null;
+  if (args?.announce !== false) {
+    const isUpdate = prev?.date === wl.date;
+    announced = await sendTelegram(env, formatWatchlistAnnouncement(wl, { isUpdate }));
+  }
   return {
     ok: true,
+    announced: announced == null ? "未推播（announce=false）" : announced.ok ? `已推播到 ${announced.sentTo} 個收件者` : `推播失敗：${announced.reason}`,
     date: wl.date,
     items: wl.items.map((it) => `${it.symbol} ${it.name}：${it.entries.length} 個條件，失效價 ${it.invalidBelow ?? "未設"}`),
     noNewEntryAfter: wl.noNewEntryAfter,
