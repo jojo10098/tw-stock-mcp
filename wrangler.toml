@@ -1,0 +1,7 @@
+name = "tw-stock-mcp"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+
+# 金鑰類設定一律用 Secret，不要寫在這裡：
+#   FUGLE_API_KEY  富果行情 API 金鑰
+#   MCP_TOKEN      隨機字串（至少 16 字元），連接器網址為 /mcp/<MCP_TOKEN>
