@@ -11,7 +11,7 @@
 
 const FUGLE_BASE = "https://api.fugle.tw/marketdata/v1.0/stock";
 const SERVER_INFO = { name: "tw-stock-mcp", version: "0.1.0" };
-const SUPPORTED_PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"];
+const SUPPORTED_PROTOCOLS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
 const INDEX_SYMBOLS = {
   IX0001: "加權指數（上市）",
@@ -329,6 +329,36 @@ export default {
 
     if (url.pathname === "/" || url.pathname === "/health") {
       return json({ ok: true, server: SERVER_INFO });
+    }
+
+    // 診斷：只回報設定是否存在，不洩漏內容
+    if (url.pathname === "/status") {
+      return json({
+        server: SERVER_INFO,
+        fugleKeySet: Boolean(env.FUGLE_API_KEY),
+        mcpTokenSet: Boolean(env.MCP_TOKEN),
+        mcpTokenLongEnough: Boolean(env.MCP_TOKEN && env.MCP_TOKEN.length >= 16),
+        mcpTokenLength: env.MCP_TOKEN ? env.MCP_TOKEN.length : 0,
+      });
+    }
+
+    // 診斷：帶正確 token 才會實際呼叫富果一次
+    const st = url.pathname.match(/^\/selftest\/([^/]+)\/?$/);
+    if (st) {
+      if (!env.MCP_TOKEN || !safeEqual(decodeURIComponent(st[1]), env.MCP_TOKEN)) {
+        return json({ ok: false, reason: "token 不符或 MCP_TOKEN 未設定" });
+      }
+      try {
+        const q = await fugle(env, "/intraday/quote/2330");
+        return json({ ok: true, fugle: "ok", sample: summarizeQuote(q) });
+      } catch (e) {
+        return json({ ok: false, fugle: e.status ?? "error", message: e.message });
+      }
+    }
+
+    // OAuth 探測一律回 404，代表這個伺服器不需要登入
+    if (url.pathname.startsWith("/.well-known/")) {
+      return json({ error: "Not found" }, 404);
     }
 
     const m = url.pathname.match(/^\/mcp\/([^/]+)\/?$/);
