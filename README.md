@@ -1,6 +1,6 @@
 # tw-stock-mcp
 
-台股即時行情的遠端 MCP server，部署在 Cloudflare Workers，資料來自[富果 Fugle MarketData API](https://developer.fugle.tw/)。
+台股行情的遠端 MCP server，部署在 Cloudflare Workers。盤中即時資料來自[富果 Fugle MarketData API](https://developer.fugle.tw/)，盤後資料（估值、融資融券、當沖標的、注意／處置股）來自[臺灣證券交易所 OpenAPI](https://openapi.twse.com.tw/)。
 給 Claude 的連接器（含雲端排程）使用。
 
 ## 工具
@@ -12,6 +12,15 @@
 | `get_intraday_candles` | 今日分時 K（1/5/10/15/30/60 分） |
 | `get_daily_history` | 最近 N 日日 K（含振幅） |
 
+證交所 OpenAPI（僅上市股票、免金鑰、**不吃富果額度**，快取 10 分鐘）：
+
+| 工具 | 用途 |
+|---|---|
+| `get_daytrade_status` | 當沖前檢查：可否當沖、是否暫停先賣後買、是否注意股、是否處置中（含期間與措施） |
+| `get_margin_trading` | 融資融券：買賣、餘額與增減、融資使用率、券資比、資券互抵 |
+| `get_valuation` | 本益比、殖利率、股價淨值比 |
+| `get_alert_lists` | 全部注意股與處置股清單 |
+
 ## 部署
 
 1. Cloudflare 後台 → **Workers & Pages** → **Create** → **Import a repository**，選這個 repo，其他設定用預設值。
@@ -19,6 +28,7 @@
    - `FUGLE_API_KEY`：富果行情 API 金鑰
    - `MCP_TOKEN`：一串隨機字串（至少 16 字元）
 3. 打開 `https://<worker 網址>/health`，看到 `{"ok":true,...}` 就是活著。
+   打開 `https://<worker 網址>/selftest/<MCP_TOKEN>` 可同時檢查富果與證交所是否連得到。
 4. 連接器網址：`https://<worker 網址>/mcp/<MCP_TOKEN>`
 
 > 這個 repo 是公開的，所以程式碼裡**沒有任何金鑰**；兩個 Secret 只存在 Cloudflare。網址裡的 `MCP_TOKEN` 就是密碼，不要外流。
@@ -34,4 +44,5 @@ npx wrangler dev  # 本機啟動；Secret 放在 .dev.vars（已加入 .gitignor
 
 - 免費基本方案：日內行情 API 每分鐘 60 次。`get_quotes` 每檔算一次。
 - 富果時間戳為 epoch 微秒，已轉成台北時間。成交量單位：個股為「張」。
+- 證交所資料為**前一個交易日盤後**公布，盤中不會變動；上櫃股票目前不支援。
 - 資料僅供參考，非投資建議。

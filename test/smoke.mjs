@@ -4,8 +4,41 @@ import worker from "../src/index.js";
 const TOKEN = "test-token-1234567890";
 const env = { FUGLE_API_KEY: "dummy", MCP_TOKEN: TOKEN };
 
+// 證交所 OpenAPI 假資料（欄位名稱取自實際回應）
+const TWSE = {
+  "/v1/exchangeReport/BWIBBU_ALL": [
+    { Date: "1151019", Code: "1101", Name: "台泥", PEratio: "", DividendYield: "2.95", PBratio: "0.88" },
+    { Date: "1151019", Code: "2330", Name: "台積電", PEratio: "22.10", DividendYield: "1.35", PBratio: "6.50" },
+  ],
+  "/v1/exchangeReport/MI_MARGN": [
+    { "股票代號": "2330", "股票名稱": "台積電", "融資買進": "1,200", "融資賣出": "800", "融資現金償還": "10",
+      "融資前日餘額": "20000", "融資今日餘額": "20390", "融資限額": "6,483,000", "融券買進": "50", "融券賣出": "150",
+      "融券現券償還": "", "融券前日餘額": "300", "融券今日餘額": "400", "融券限額": "6,483,000", "資券互抵": "33", "註記": " " },
+  ],
+  "/v1/exchangeReport/TWTB4U": [
+    { Date: "1151019", Code: "2330", Name: "台積電", Suspension: "" },
+    { Date: "1151019", Code: "2344", Name: "華邦電", Suspension: "Y" },
+  ],
+  "/v1/announcement/notice": [
+    { Number: "1", Code: "2344", Name: "華邦電", NumberOfAnnouncement: "2", TradingInfoForAttention: "最近六個營業日累積收盤價漲幅達32%", Date: "1151019", ClosingPrice: "45.6", PE: "30.1" },
+  ],
+  "/v1/announcement/punish": [
+    { Number: "1", Date: "1151014", Code: "2344", Name: "華邦電", NumberOfAnnouncement: "1", ReasonsOfDisposition: "連續三次",
+      DispositionPeriod: "115/10/15～115/10/21", DispositionMeasures: "第一次處置", Detail: "約每五分鐘撮合一次", LinkInformation: "" },
+  ],
+};
+const EMPTY_NOTICE = [{ Number: "0", Code: "", Name: "", NumberOfAnnouncement: "0", TradingInfoForAttention: "", Date: "", ClosingPrice: "0", PE: "0" }];
+let twseCalls = 0;
+let noticeEmpty = false;
+
 globalThis.fetch = async (url) => {
   const u = new URL(url);
+  if (u.hostname === "openapi.twse.com.tw") {
+    twseCalls++;
+    if (noticeEmpty && u.pathname === "/v1/announcement/notice") return new Response(JSON.stringify(EMPTY_NOTICE));
+    const data = TWSE[u.pathname];
+    return data ? new Response(JSON.stringify(data)) : new Response("<html>404</html>", { status: 404 });
+  }
   const sym = u.pathname.split("/").pop();
   if (u.pathname.includes("/intraday/quote/")) {
     return new Response(JSON.stringify({
@@ -41,7 +74,7 @@ const init = await call({ jsonrpc: "2.0", id: 1, method: "initialize", params: {
 check("initialize", init.body.result?.serverInfo?.name === "tw-stock-mcp");
 check("notification → 202", (await call({ jsonrpc: "2.0", method: "notifications/initialized" })).status === 202);
 const list = await call({ jsonrpc: "2.0", id: 2, method: "tools/list" });
-check("tools/list 有 4 個工具", list.body.result.tools.length === 4);
+check("tools/list 有 8 個工具", list.body.result.tools.length === 8);
 const q = await call({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "get_quotes", arguments: { symbols: ["2330", "IX0001"] } } });
 const qd = JSON.parse(q.body.result.content[0].text);
 check("get_quotes 跳空 1%", qd.quotes[0].openGapPercent === 1);
@@ -53,6 +86,49 @@ const h = await call({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { na
 check("get_daily_history 新到舊", JSON.parse(h.body.result.content[0].text).candles[0].date === "2026-10-17");
 const o = await call({ jsonrpc: "2.0", id: 6, method: "tools/call", params: { name: "get_market_overview", arguments: {} } });
 check("get_market_overview", JSON.parse(o.body.result.content[0].text).quotes.length === 2);
+
+// --- 證交所 OpenAPI 工具 ---
+const tool = async (name, args) => {
+  const r = await call({ jsonrpc: "2.0", id: 99, method: "tools/call", params: { name, arguments: args } });
+  return { isError: r.body.result.isError, data: r.body.result.isError ? r.body.result.content[0].text : JSON.parse(r.body.result.content[0].text) };
+};
+
+const v = await tool("get_valuation", { symbols: ["2330", "1101", "6488"] });
+check("valuation 數值", v.data.results[0].peRatio === 22.1 && v.data.results[0].dividendYieldPercent === 1.35);
+check("valuation 民國轉西元", v.data.results[0].date === "2026-10-19");
+check("valuation 空本益比 → null", v.data.results[1].peRatio === null);
+check("valuation 上櫃/查無 → error", typeof v.data.results[2].error === "string");
+
+const mg = await tool("get_margin_trading", { symbols: ["2330.TW"] });
+const m0 = mg.data.results[0];
+check("margin 千分位與增減", m0.margin.buy === 1200 && m0.margin.change === 390 && m0.short.change === 100);
+check("margin 券資比", m0.shortToMarginRatioPercent === 1.96);
+check("margin 空字串 → null", m0.short.stockRedemption === null && m0.note === null);
+
+const dt = await tool("get_daytrade_status", { symbols: ["2330", "2344", "9999"] });
+const [tsmc, wb, none] = dt.data.results;
+check("daytrade 正常股", tsmc.canDayTrade && !tsmc.isDisposed && !tsmc.isAttention && tsmc.warnings.length === 0);
+check("daytrade 暫停先賣後買+注意+處置", wb.sellFirstSuspended === "Y" && wb.isAttention && wb.isDisposed && wb.warnings.length === 3);
+check("daytrade 處置期間", wb.disposition[0].period === "115/10/15～115/10/21");
+check("daytrade 不在名單", none.canDayTrade === false && none.warnings.length === 1);
+
+const callsBefore = twseCalls;
+await tool("get_valuation", { symbols: ["2330"] });
+check("證交所記憶體快取", twseCalls === callsBefore);
+
+const al = await tool("get_alert_lists", {});
+check("alert_lists", al.data.attentionCount === 1 && al.data.dispositionCount === 1);
+
+check("證交所工具不需富果金鑰", await (async () => {
+  const res = await worker.fetch(new Request(`https://x.dev/mcp/${TOKEN}`, { method: "POST", body: JSON.stringify(
+    { jsonrpc: "2.0", id: 100, method: "tools/call", params: { name: "get_valuation", arguments: { symbols: ["2330"] } } }) }),
+    { MCP_TOKEN: TOKEN });
+  return !(await res.json()).result.isError;
+})());
+
+const bad = await tool("get_valuation", { symbols: [] });
+check("空 symbols → isError", bad.isError === true);
+
 check("錯誤 token → 404", (await call({ jsonrpc: "2.0", id: 7, method: "tools/list" }, "/mcp/wrong")).status === 404);
 
 process.exit(failed ? 1 : 0);
