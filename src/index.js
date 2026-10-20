@@ -14,7 +14,7 @@
 const FUGLE_BASE = "https://api.fugle.tw/marketdata/v1.0/stock";
 const TWSE_BASE = "https://openapi.twse.com.tw/v1";
 const TWSE_CACHE_SECONDS = 600; // 證交所資料一天更新一次，快取 10 分鐘足夠
-const SERVER_INFO = { name: "tw-stock-mcp", version: "0.2.0" };
+const SERVER_INFO = { name: "tw-stock-mcp", version: "0.2.1" };
 const SUPPORTED_PROTOCOLS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
 const INDEX_SYMBOLS = {
@@ -30,7 +30,7 @@ const TOOLS = [
   {
     name: "get_quotes",
     description:
-      "查詢台股個股或指數的即時報價（盤中）。一次最多 10 檔。回傳開盤價、最新成交價、最高、最低、昨收（參考價）、漲跌、漲跌幅、開盤跳空幅度、累計成交量、漲跌停價、是否觸及漲跌停，以及資料時間（台北時間）。指數代號：IX0001 加權指數、IX0043 櫃買指數。",
+      "查詢台股個股或指數的即時報價（盤中，上市上櫃都支援）。一次最多 10 檔。回傳開盤價、最新成交價、最高、最低、昨收（參考價）、漲跌、漲跌幅、開盤跳空幅度、累計成交量、最佳五檔、漲跌停價、距漲停／跌停 %、是否觸及漲跌停；個股另附當天的可否現沖（canDayTrade）、只能先買後賣、平盤下可否融券、是否注意股、是否處置股、撮合循環秒數。資料時間為台北時間。指數代號：IX0001 加權指數、IX0043 櫃買指數。額度：每檔每次 1 次，個股當天第一次查詢多 1 次（漲跌停資料快取一整天）。",
     inputSchema: {
       type: "object",
       properties: {
@@ -201,14 +201,79 @@ function normalizeSymbol(s) {
   return String(s).trim().toUpperCase().replace(/\.(TW|TWO)$/, "");
 }
 
-function summarizeQuote(q) {
+// 今天的台北日期 "YYYY-MM-DD"
+function taipeiToday() {
+  return new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);
+}
+
+// ---------------------------------------------------------------------------
+// 富果 Ticker（漲跌停價、可否當沖、注意／處置）：當天不會變，快取一整天
+// ---------------------------------------------------------------------------
+
+const tickerMemo = new Map(); // "日期:代號" → ticker
+const TICKER_CACHE_HOST = "https://tw-stock-mcp.internal/ticker/";
+
+async function getTicker(env, symbol) {
+  const today = taipeiToday();
+  const memoKey = `${today}:${symbol}`;
+  if (tickerMemo.has(memoKey)) return tickerMemo.get(memoKey);
+
+  // Cloudflare 邊緣快取（跨請求、跨 isolate）；本機測試時沒有 caches 就略過
+  const cache = typeof caches !== "undefined" ? caches.default : null;
+  const cacheKey = new Request(`${TICKER_CACHE_HOST}${today}/${encodeURIComponent(symbol)}`);
+  if (cache) {
+    const hit = await cache.match(cacheKey);
+    if (hit) {
+      const t = await hit.json();
+      tickerMemo.set(memoKey, t);
+      return t;
+    }
+  }
+
+  const t = await fugle(env, `/intraday/ticker/${encodeURIComponent(symbol)}`);
+  // 只有拿到「今天」的 ticker 才長時間快取；開盤前可能還是前一天的資料，只快取 5 分鐘
+  const isToday = t?.date === today;
+  if (isToday) {
+    if (tickerMemo.size > 2000) tickerMemo.clear();
+    tickerMemo.set(memoKey, t);
+  }
+  if (cache) {
+    const ttl = isToday ? 12 * 3600 : 300;
+    await cache.put(cacheKey, new Response(JSON.stringify(t), {
+      headers: { "content-type": "application/json", "cache-control": `max-age=${ttl}` },
+    }));
+  }
+  return t;
+}
+
+function summarizeTicker(t) {
+  if (!t) return {};
+  return {
+    referencePrice: t.referencePrice ?? null,
+    limitUpPrice: t.limitUpPrice ?? null,
+    limitDownPrice: t.limitDownPrice ?? null,
+    canDayTrade: t.canDayTrade ?? null, // 可買賣現沖
+    canBuyFirstDayTradeOnly: t.canDayTrade == null ? null : !t.canDayTrade && t.canBuyDayTrade === true, // 只能先買後賣
+    canBelowFlatShortSell: t.canBelowFlatMarginShortSell ?? null, // 平盤下得融券賣出
+    isAttention: t.isAttention ?? null,
+    isDisposition: t.isDisposition ?? null,
+    matchingIntervalSeconds: t.matchingInterval ?? null, // 處置股常見：非 0 代表分盤撮合
+    securityStatus: t.securityStatus ?? null,
+  };
+}
+
+function summarizeQuote(q, t) {
   const prev = q.previousClose ?? q.referencePrice ?? null;
   const total = q.total || {};
+  const last = q.lastPrice ?? q.closePrice ?? null;
+  const tk = summarizeTicker(t);
+  const limitUp = tk.limitUpPrice ?? null;
+  const limitDown = tk.limitDownPrice ?? null;
   return {
     symbol: q.symbol,
     name: q.name ?? INDEX_SYMBOLS[q.symbol] ?? null,
     date: q.date,
-    lastPrice: q.lastPrice ?? q.closePrice ?? null,
+    lastPrice: last,
     openPrice: q.openPrice ?? null,
     highPrice: q.highPrice ?? null,
     lowPrice: q.lowPrice ?? null,
@@ -219,10 +284,23 @@ function summarizeQuote(q) {
     avgPrice: q.avgPrice ?? null,
     tradeVolume: total.tradeVolume ?? null, // 股票為「張」
     tradeValue: total.tradeValue ?? null,
-    limitUpPrice: q.limitUpPrice ?? null,
-    limitDownPrice: q.limitDownPrice ?? null,
+    limitUpPrice: limitUp,
+    limitDownPrice: limitDown,
+    toLimitUpPercent: limitUp != null && last ? pct(limitUp, last) : null, // 距漲停還有幾 %
+    toLimitDownPercent: limitDown != null && last ? pct(limitDown, last) : null, // 距跌停（負值）
     isLimitUp: Boolean(q.isLimitUpPrice || q.isLimitUpBid),
     isLimitDown: Boolean(q.isLimitDownPrice || q.isLimitDownAsk),
+    ...(t
+      ? {
+          canDayTrade: tk.canDayTrade,
+          canBuyFirstDayTradeOnly: tk.canBuyFirstDayTradeOnly,
+          canBelowFlatShortSell: tk.canBelowFlatShortSell,
+          isAttention: tk.isAttention,
+          isDisposition: tk.isDisposition,
+          matchingIntervalSeconds: tk.matchingIntervalSeconds,
+          securityStatus: tk.securityStatus,
+        }
+      : {}),
     isTrial: Boolean(q.isTrial),
     isClose: Boolean(q.isClose),
     lastUpdated: toTaipeiTime(q.lastUpdated),
@@ -242,9 +320,17 @@ async function getQuotes(env, args) {
   const results = await Promise.all(
     symbols.map(async (raw) => {
       const symbol = normalizeSymbol(raw);
+      const isIndex = /^IX\d+$/.test(symbol);
       try {
-        const q = await fugle(env, `/intraday/quote/${encodeURIComponent(symbol)}`);
-        return summarizeQuote(q);
+        // 指數沒有漲跌停，不查 ticker；ticker 失敗不影響報價
+        const [q, t] = await Promise.all([
+          fugle(env, `/intraday/quote/${encodeURIComponent(symbol)}`),
+          isIndex ? null : getTicker(env, symbol).catch((e) => ({ __error: e.message })),
+        ]);
+        const tickerError = t?.__error;
+        const out = summarizeQuote(q, tickerError ? null : t);
+        if (tickerError) out.tickerError = "漲跌停價暫時取不到：" + tickerError;
+        return out;
       } catch (e) {
         return { symbol, error: e.message };
       }
@@ -639,8 +725,10 @@ export default {
       }
       const out = { ok: true };
       try {
-        const q = await fugle(env, "/intraday/quote/2330");
-        out.fugle = { ok: true, sample: summarizeQuote(q) };
+        const r = await getQuotes(env, { symbols: ["2330"] });
+        const sample = r.quotes[0];
+        if (sample.error) throw Object.assign(new Error(sample.error), { status: "error" });
+        out.fugle = { ok: true, tickerOk: sample.limitUpPrice != null, sample };
       } catch (e) {
         out.ok = false;
         out.fugle = { ok: false, status: e.status ?? "error", message: e.message };

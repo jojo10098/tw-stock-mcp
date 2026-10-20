@@ -29,6 +29,7 @@ const TWSE = {
 };
 const EMPTY_NOTICE = [{ Number: "0", Code: "", Name: "", NumberOfAnnouncement: "0", TradingInfoForAttention: "", Date: "", ClosingPrice: "0", PE: "0" }];
 let twseCalls = 0;
+const tickerCalls = [];
 let noticeEmpty = false;
 
 globalThis.fetch = async (url) => {
@@ -40,6 +41,17 @@ globalThis.fetch = async (url) => {
     return data ? new Response(JSON.stringify(data)) : new Response("<html>404</html>", { status: 404 });
   }
   const sym = u.pathname.split("/").pop();
+  if (u.pathname.includes("/intraday/ticker/")) {
+    tickerCalls.push(sym);
+    if (sym === "FAIL") return new Response("rate limited", { status: 429 });
+    const today = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);
+    return new Response(JSON.stringify({
+      date: today, symbol: sym, name: "測試股", referencePrice: 100, previousClose: 100,
+      limitUpPrice: 110, limitDownPrice: 90, canDayTrade: sym !== "2344", canBuyDayTrade: true,
+      canBelowFlatMarginShortSell: true, isAttention: sym === "2344", isDisposition: sym === "2344",
+      matchingInterval: sym === "2344" ? 300 : 0, securityStatus: "NORMAL",
+    }));
+  }
   if (u.pathname.includes("/intraday/quote/")) {
     return new Response(JSON.stringify({
       date: "2026-10-20", symbol: sym, name: sym === "IX0001" ? undefined : "測試股",
@@ -80,6 +92,15 @@ const qd = JSON.parse(q.body.result.content[0].text);
 check("get_quotes 跳空 1%", qd.quotes[0].openGapPercent === 1);
 check("get_quotes 台北時間", /\(UTC\+8\)$/.test(qd.quotes[0].lastUpdated));
 check("指數名稱", qd.quotes[1].name === "加權指數（上市）");
+check("漲跌停價（來自 ticker）", qd.quotes[0].limitUpPrice === 110 && qd.quotes[0].limitDownPrice === 90);
+check("距漲停 %", qd.quotes[0].toLimitUpPercent === 7.84 && qd.quotes[0].toLimitDownPercent === -11.76);
+check("個股附可否現沖", qd.quotes[0].canDayTrade === true && qd.quotes[0].isDisposition === false);
+check("指數不查 ticker", !tickerCalls.includes("IX0001") && qd.quotes[1].canDayTrade === undefined);
+await call({ jsonrpc: "2.0", id: 31, method: "tools/call", params: { name: "get_quotes", arguments: { symbols: ["2330"] } } });
+check("ticker 當天快取", tickerCalls.filter((s) => s === "2330").length === 1);
+const q2 = JSON.parse((await call({ jsonrpc: "2.0", id: 32, method: "tools/call", params: { name: "get_quotes", arguments: { symbols: ["2344", "FAIL"] } } })).body.result.content[0].text);
+check("處置股：只能先買後賣、分盤撮合", q2.quotes[0].canBuyFirstDayTradeOnly === true && q2.quotes[0].matchingIntervalSeconds === 300);
+check("ticker 失敗仍回報價", q2.quotes[1].lastPrice === 102 && q2.quotes[1].limitUpPrice === null && /漲跌停價暫時取不到/.test(q2.quotes[1].tickerError));
 const c = await call({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "get_intraday_candles", arguments: { symbol: "2330" } } });
 check("get_intraday_candles", JSON.parse(c.body.result.content[0].text).count === 1);
 const h = await call({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "get_daily_history", arguments: { symbol: "2330", days: 5 } } });
