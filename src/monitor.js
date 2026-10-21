@@ -37,6 +37,12 @@ const LAST_CHECK_MIN = 13 * 60 + 25;
 // 檢查間隔：依監控檔數自動調整，讓監控最多用掉富果即時額度（60 次／分）的一半，
 // 其餘留給晨報、盤中檢查與手動查價。可用環境變數微調：
 //   MONITOR_INTERVAL_SECONDS（最短間隔，預設 5 秒）、MONITOR_QUOTA_PER_MIN（監控可用額度，預設 30）
+/** 保護條件（大盤、同業）的查價間隔：不需要秒級，最多用每分鐘 15 次額度，至少 30 秒一次 */
+export function guardRefreshSeconds(guardCount) {
+  if (!guardCount) return 0;
+  return Math.max(30, Math.ceil((guardCount * 60) / 15));
+}
+
 export function checkIntervalSeconds(env, symbolCount) {
   const floor = Math.max(3, Number(env?.MONITOR_INTERVAL_SECONDS) || 5);
   const budget = Math.min(55, Math.max(6, Number(env?.MONITOR_QUOTA_PER_MIN) || 30));
@@ -160,6 +166,26 @@ function strList(v, maxItems, maxLen) {
   return v.map((x) => String(x ?? "").trim()).filter(Boolean).slice(0, maxItems).map((x) => x.slice(0, maxLen));
 }
 
+const SYMBOL_RE = /^(IX\d{4}|[0-9A-Z]{4,6})$/;
+
+function pctIn(v, def, lo, hi, field) {
+  if (v === undefined || v === null) return def;
+  const n = Math.abs(Number(v));
+  if (!Number.isFinite(n) || n < lo || n > hi) throw new Error(`${field} 需介於 ${lo}–${hi}（%）`);
+  return n;
+}
+
+/** 大盤保護：預設看加權指數與台積電，任一跌幅 ≥ 1.5% 就暫停新的進場通知；enabled:false 可關閉 */
+export const DEFAULT_MARKET_GUARD = { enabled: true, symbols: ["IX0001", "2330"], dropPercent: 1.5 };
+function validateMarketGuard(g) {
+  if (g === false || g?.enabled === false) return { ...DEFAULT_MARKET_GUARD, enabled: false };
+  const symbols = Array.isArray(g?.symbols) && g.symbols.length
+    ? g.symbols.map((x) => String(x).trim().toUpperCase()).slice(0, 3)
+    : DEFAULT_MARKET_GUARD.symbols;
+  for (const x of symbols) if (!SYMBOL_RE.test(x)) throw new Error(`marketGuard.symbols 格式錯誤：${x}`);
+  return { enabled: true, symbols, dropPercent: pctIn(g?.dropPercent, DEFAULT_MARKET_GUARD.dropPercent, 0.3, 5, "marketGuard.dropPercent") };
+}
+
 export function validateWatchlist(input) {
   const date = String(input?.date ?? "");
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error("date 必須是 YYYY-MM-DD（台北日期）");
@@ -185,6 +211,12 @@ export function validateWatchlist(input) {
       reason: it?.reason ? String(it.reason).slice(0, 200) : undefined,
       checks: strList(it?.checks, 8, 60),
       tier: it?.tier === "secondary" ? "secondary" : "main",
+      peers: (Array.isArray(it?.peers) ? it.peers : []).slice(0, 3).map((x) => {
+        const p = String(x ?? "").trim().toUpperCase();
+        if (!SYMBOL_RE.test(p) || p === symbol) throw new Error(`${symbol}.peers 格式錯誤：${x}`);
+        return p;
+      }),
+      peerDropPercent: pctIn(it?.peerDropPercent, 2, 0.3, 8, `${symbol}.peerDropPercent`),
       entries: entries.map((e, j) => {
         const id = String(e?.id ?? `e${j + 1}`);
         if (ids.has(id)) throw new Error(`${symbol} 的條件 id 重複：${id}`);
@@ -210,6 +242,7 @@ export function validateWatchlist(input) {
     date,
     noNewEntryAfter,
     criteria: strList(input?.criteria, 10, 80),
+    marketGuard: validateMarketGuard(input?.marketGuard),
     noPickReason: input?.noPickReason ? String(input.noPickReason).slice(0, 200) : undefined,
     items: out,
     setAt: new Date().toISOString(),
@@ -296,6 +329,11 @@ export function evaluateItem(item, quote, st, ctx) {
       continue;
     }
     if (ctx.minute > ctx.noNewEntryMin) continue; // 太晚不再發進場通知
+    if (ctx.blockEntries) {
+      // 大盤或同業保護中：不累計「連續成立」時間，也不發進場通知
+      delete st.holdSince[e.id];
+      continue;
+    }
 
     let ok = price >= e.priceAbove;
     if (ok && e.minVolumeRatio != null) ok = volRatio != null && volRatio >= e.minVolumeRatio;
@@ -313,6 +351,73 @@ export function evaluateItem(item, quote, st, ctx) {
     }
   }
   return events;
+}
+
+// ---------------------------------------------------------------------------
+// 保護條件（大盤、同業）：觸發時暫停新的進場通知，回穩（多回升 0.5 個百分點）才恢復
+// ---------------------------------------------------------------------------
+
+const RESUME_MARGIN = 0.5;
+
+/** 監控需要查價的代號：標的、大盤保護、同業 */
+export function guardSymbols(wl) {
+  const g = wl?.marketGuard?.enabled === false ? [] : (wl?.marketGuard?.symbols ?? DEFAULT_MARKET_GUARD.symbols);
+  const peers = (wl?.items ?? []).flatMap((it) => it.peers ?? []);
+  const own = new Set((wl?.items ?? []).map((it) => it.symbol));
+  return [...new Set([...g, ...peers])].filter((x) => !own.has(x));
+}
+
+/**
+ * 大盤保護判斷
+ * @param guard   wl.marketGuard
+ * @param quotes  { symbol: quote }
+ * @param paused  目前是否暫停中
+ * @returns { paused, changed, detail }
+ */
+export function evalMarketGuard(guard, quotes, paused) {
+  if (!guard || guard.enabled === false) return { paused: false, changed: paused === true, detail: [] };
+  const detail = guard.symbols
+    .map((sym) => ({ sym, q: quotes[sym] }))
+    .filter((x) => x.q && !x.q.error && x.q.isToday !== false && x.q.changePercent != null)
+    .map((x) => ({ symbol: x.sym, name: x.q.name ?? x.sym, changePercent: x.q.changePercent }));
+  if (!detail.length) return { paused, changed: false, detail };
+  const worst = Math.min(...detail.map((d) => d.changePercent));
+  let next = paused;
+  if (!paused && worst <= -guard.dropPercent) next = true;
+  else if (paused && worst > -(guard.dropPercent - RESUME_MARGIN)) next = false;
+  return { paused: next, changed: next !== paused, detail, worst };
+}
+
+/** 同業保護判斷：同業平均漲跌幅 ≤ −peerDropPercent 時暫停該檔 */
+export function evalPeerGuard(item, quotes, paused) {
+  if (!item.peers?.length) return { paused: false, changed: false, detail: [] };
+  const detail = item.peers
+    .map((sym) => ({ sym, q: quotes[sym] }))
+    .filter((x) => x.q && !x.q.error && x.q.isToday !== false && x.q.changePercent != null)
+    .map((x) => ({ symbol: x.sym, name: x.q.name ?? x.sym, changePercent: x.q.changePercent }));
+  if (!detail.length) return { paused, changed: false, detail };
+  const avg = detail.reduce((a, d) => a + d.changePercent, 0) / detail.length;
+  let next = paused;
+  if (!paused && avg <= -item.peerDropPercent) next = true;
+  else if (paused && avg > -(item.peerDropPercent - RESUME_MARGIN)) next = false;
+  return { paused: next, changed: next !== paused, detail, avg: Math.round(avg * 100) / 100 };
+}
+
+const pctTxt = (n) => `${n > 0 ? "+" : ""}${Number(n).toFixed(2)}%`;
+
+export function formatMarketGuard(g, r, hhmm) {
+  const list = r.detail.map((d) => `${d.name} ${pctTxt(d.changePercent)}`).join("、");
+  return r.paused
+    ? `⚠️ 大盤轉弱，暫停進場（${hhmm}）\n${list}（門檻 -${g.dropPercent}%）\n暫停所有新的進場通知；已進場的部位仍會追蹤停損與目標。`
+    : `✅ 大盤回穩，恢復進場監控（${hhmm}）\n${list}`;
+}
+
+export function formatPeerGuard(item, r, hhmm) {
+  const title = `${item.symbol} ${item.name ?? ""}`.trim();
+  const list = r.detail.map((d) => `${d.name} ${pctTxt(d.changePercent)}`).join("、");
+  return r.paused
+    ? `⏸ 同業轉弱｜${title}（${hhmm}）\n${list}，平均 ${pctTxt(r.avg)}（門檻 -${item.peerDropPercent}%）\n這檔暫停進場通知；已進場的部位仍會追蹤停損與目標。`
+    : `▶️ 同業回穩｜${title}（${hhmm}）\n${list}，平均 ${pctTxt(r.avg)}，恢復這檔的進場監控。`;
 }
 
 // ---------------------------------------------------------------------------
@@ -403,8 +508,14 @@ export function formatWatchlistAnnouncement(wl, { isUpdate = false, test = false
       const lv = exitLevels(p);
       lines.push(`  1 張約 ${fmt(Math.round(p * 1000))} 元；依觸發價停損 ${fmt(lv.stop)}，約虧 ${fmt(Math.round((p - lv.stop) * 1000))} 元`);
     }
+    if (it.peers?.length) lines.push(`  同業保護：${it.peers.join("、")} 平均跌逾 ${it.peerDropPercent}% 時暫停進場`);
     if (it.note) lines.push(`  備註：${it.note}`);
   });
+  const mgd = wl.marketGuard ?? DEFAULT_MARKET_GUARD;
+  if (mgd.enabled !== false) {
+    const names = mgd.symbols.map((x) => (x === "IX0001" ? "加權指數" : x === "IX0043" ? "櫃買指數" : x === "2330" ? "台積電" : x)).join("或");
+    lines.push("", `🛡 大盤保護：${names}跌逾 ${mgd.dropPercent}% 時暫停所有進場通知`);
+  }
   lines.push("", `${wl.noNewEntryAfter} 後不發新進場通知；有部位 13:20 前平倉。`, "⚠️ 這是條件監控清單，不是買賣建議。");
   const text = lines.join("\n");
   return text.length > 4000 ? text.slice(0, 3990) + "\n…（過長截斷）" : text; // Telegram 單則上限 4096 字
@@ -593,14 +704,45 @@ export async function runMonitorTick(env, now, deps) {
   }
 
   const messages = [];
+
+  // 保護條件報價：大盤與同業不需要秒級，依 guardRefreshSeconds 定期更新、存在 state 中沿用
+  const gSyms = guardSymbols(wl);
+  state.guard ??= { quotes: {}, at: null, marketPaused: false };
+  if (gSyms.length && (state.guard.at == null || t.sec - state.guard.at >= guardRefreshSeconds(gSyms.length))) {
+    try {
+      const got = {};
+      for (let i = 0; i < gSyms.length; i += 10) {
+        const r = await deps.getQuotes(env, { symbols: gSyms.slice(i, i + 10) });
+        for (const x of r.quotes || []) got[x.symbol] = { name: x.name, changePercent: x.changePercent, isToday: x.isToday, error: x.error };
+      }
+      state.guard.quotes = got;
+      state.guard.at = t.sec;
+    } catch {
+      /* 查不到就沿用上一次的值 */
+    }
+  }
+  const gq = state.guard.quotes;
+  const noNewEntryMin = hhmmToMinute(wl.noNewEntryAfter) ?? 12 * 60 + 30;
+  const canStillEnter = t.minute <= noNewEntryMin;
+  const mg = evalMarketGuard(wl.marketGuard ?? DEFAULT_MARKET_GUARD, gq, state.guard.marketPaused);
+  if (mg.changed) {
+    state.guard.marketPaused = mg.paused;
+    if (canStillEnter) messages.push(formatMarketGuard(wl.marketGuard ?? DEFAULT_MARKET_GUARD, mg, t.hhmmss));
+  }
+
   if (active.length) {
     const q = await deps.getQuotes(env, { symbols: active.map((it) => it.symbol) });
     const bySym = Object.fromEntries((q.quotes || []).map((x) => [x.symbol, x]));
-    const noNewEntryMin = hhmmToMinute(wl.noNewEntryAfter) ?? 12 * 60 + 30;
     for (const it of active) {
       const st = (state.symbols[it.symbol] ??= newSymbolState());
       const quote = bySym[it.symbol];
-      const events = evaluateItem(it, quote, st, { minute: t.minute, sec: t.sec, hhmm: t.hhmmss, noNewEntryMin, volBase: state.volBase[it.symbol] });
+      const pg = evalPeerGuard(it, gq, st.peerPaused === true);
+      if (pg.changed) {
+        st.peerPaused = pg.paused;
+        if (canStillEnter && !st.invalidated) messages.push(formatPeerGuard(it, pg, t.hhmmss));
+      }
+      const blockEntries = state.guard.marketPaused || st.peerPaused === true;
+      const events = evaluateItem(it, quote, st, { minute: t.minute, sec: t.sec, hhmm: t.hhmmss, noNewEntryMin, volBase: state.volBase[it.symbol], blockEntries });
       for (const ev of events) {
         st.log.push({ at: t.hhmmss, type: ev.type, id: ev.entry?.id ?? ev.pos?.id ?? null, price: ev.price });
         messages.push(formatEvent(it, quote, ev, t.hhmmss));
@@ -639,6 +781,12 @@ export async function watchStatus(env, now = new Date(Date.now())) {
     activeToday: wl?.date === t.date,
     noNewEntryAfter: wl?.noNewEntryAfter ?? null,
     checkIntervalSeconds: checkIntervalSeconds(env, wl?.items?.length || 1),
+    marketGuard: wl ? {
+      ...(wl.marketGuard ?? DEFAULT_MARKET_GUARD),
+      paused: state?.guard?.marketPaused ?? false,
+      refreshSeconds: guardRefreshSeconds(guardSymbols(wl).length),
+      lastQuotes: state?.guard?.quotes ?? {},
+    } : null,
     lastCheck: state?.lastCheck ?? null,
     telegramConfigured: Boolean(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID),
     items: (wl?.items ?? []).map((it) => {
@@ -666,6 +814,9 @@ export async function watchStatus(env, now = new Date(Date.now())) {
           status: st?.fired?.[e.id] ? `已觸發 ${st.fired[e.id].at} @ ${st.fired[e.id].price}` : st?.abandoned?.[e.id] ? "已放棄" : "監控中",
         })),
         invalidated: st?.invalidated ?? false,
+        peers: it.peers ?? [],
+        peerDropPercent: it.peerDropPercent,
+        peerPaused: st?.peerPaused ?? false,
         positions: Object.values(st?.positions ?? {}).map((p) => ({
           id: p.id, label: p.label, entryAt: p.at, entryPrice: p.entryPrice, stop: p.stop, target: p.target,
           status: p.status === "open" ? "持有中（追蹤停損／目標）" : p.status === "target" ? "已達第一目標，剩餘保本追蹤" : `已結束（${p.exit?.type === "stop" ? "停損" : "保本"} ${p.exit?.at} @ ${p.exit?.price}）`,

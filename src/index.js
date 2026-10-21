@@ -19,7 +19,7 @@ import { WatchMonitor, validateWatchlist, kvGet, kvPut, formatWatchlistAnnouncem
 export { WatchMonitor };
 setMonitorDeps({ getQuotes, getDailyHistory, getMinuteHistory });
 
-const SERVER_INFO = { name: "tw-stock-mcp", version: "0.5.0" };
+const SERVER_INFO = { name: "tw-stock-mcp", version: "0.6.0" };
 const SUPPORTED_PROTOCOLS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
 const INDEX_SYMBOLS = {
@@ -154,7 +154,7 @@ const TOOLS = [
   {
     name: "set_daytrade_watchlist",
     description:
-      "【盤中監控】寫入今天的當沖監控清單（覆蓋前一份）。寫入後，伺服器會在台北時間 09:01–13:25 每數秒（依檔數自動調整，3 檔約 6 秒）查一次即時報價，條件成立時用 Telegram 通知使用者；每個條件只通知一次。最多 5 檔。每檔包含：symbol、name、prevClose（前一日收盤）、invalidBelow（失效價：現價跌到此價以下就通知失效並停止監控該檔）、entries（進場條件陣列）。每個 entry：id、label（給人看的一句話，例如「開平突破 1,270」）、when（適用開盤情境：high=跳空 +1% 以上／flat=±1% 以內／low=跳空 -1% 以下／any）、priceAbove（觸發價：現價 ≥ 此價才算成立）、holdMinutes（需連續成立幾分鐘，預設 1，建議 2–3 以減少假突破）、minVolumeRatio（選填：今日累計成交量 ÷ 近 5 日「同一時刻」的平均累計量（依實際分時量能分布，已反映開盤爆量），需 ≥ 此倍數；建議 1.3）、abandonBelow（選填：該劇本的放棄價，例如開高走低跌破某價就放棄）。另可設 noNewEntryAfter（HH:MM，預設 12:30，之後不再發進場通知）。開盤後若個股變成處置、分盤撮合或不可當沖，會自動通知失效。可附上選股條件 criteria、每檔入選理由 reason、條件檢核 checks、tier（次級觀察），會一起推播。寫入成功後會立即把今日清單推播到 Telegram（同一天重寫會標示「更新」；items 為空時推播「今日無標的」）；不想推播可設 announce=false。",
+      "【盤中監控】寫入今天的當沖監控清單（覆蓋前一份）。寫入後，伺服器會在台北時間 09:01–13:25 每數秒（依檔數自動調整，3 檔約 6 秒）查一次即時報價，條件成立時用 Telegram 通知使用者；每個條件只通知一次。最多 5 檔。每檔包含：symbol、name、prevClose（前一日收盤）、invalidBelow（失效價：現價跌到此價以下就通知失效並停止監控該檔）、entries（進場條件陣列）。每個 entry：id、label（給人看的一句話，例如「開平突破 1,270」）、when（適用開盤情境：high=跳空 +1% 以上／flat=±1% 以內／low=跳空 -1% 以下／any）、priceAbove（觸發價：現價 ≥ 此價才算成立）、holdMinutes（需連續成立幾分鐘，預設 1，建議 2–3 以減少假突破）、minVolumeRatio（選填：今日累計成交量 ÷ 近 5 日「同一時刻」的平均累計量（依實際分時量能分布，已反映開盤爆量），需 ≥ 此倍數；建議 1.3）、abandonBelow（選填：該劇本的放棄價，例如開高走低跌破某價就放棄）。另可設 noNewEntryAfter（HH:MM，預設 12:30，之後不再發進場通知）。開盤後若個股變成處置、分盤撮合或不可當沖，會自動通知失效。可附上選股條件 criteria、每檔入選理由 reason、條件檢核 checks、tier（次級觀察），會一起推播。保護條件：marketGuard（大盤／台積電跌逾 X% 暫停全部進場，預設啟用 1.5%）與每檔 peers（同業平均跌逾 X% 暫停該檔），由伺服器即時判斷並推播暫停／恢復；已進場部位不受影響、照常追蹤停損。寫入成功後會立即把今日清單推播到 Telegram（同一天重寫會標示「更新」；items 為空時推播「今日無標的」）；不想推播可設 announce=false。",
     inputSchema: {
       type: "object",
       properties: {
@@ -163,6 +163,15 @@ const TOOLS = [
         announce: { type: "boolean", description: "寫入後是否推播今日清單到 Telegram，預設 true" },
         criteria: { type: "array", maxItems: 10, items: { type: "string" }, description: "今天實際採用的選股條件（一條一句，含門檻數字），例如「前一日收盤 ≤ 250 元」「成交金額前 50 名」「近 5 日平均振幅 ≥ 3%」。會列在推播最上方" },
         noPickReason: { type: "string", description: "items 為空時：哪一項條件沒過、為何今天沒有標的" },
+        marketGuard: {
+          type: "object",
+          description: "大盤保護（預設啟用：加權指數 IX0001 或台積電 2330 任一跌幅 ≥ 1.5% 就暫停所有新的進場通知，回升 0.5 個百分點後恢復）。把劇本中「大盤／台積電跌逾 X% 就不做」寫在這裡",
+          properties: {
+            enabled: { type: "boolean" },
+            symbols: { type: "array", maxItems: 3, items: { type: "string" }, description: "預設 [\"IX0001\",\"2330\"]；櫃買指數為 IX0043" },
+            dropPercent: { type: "number", description: "跌幅門檻（%），0.3–5，預設 1.5" },
+          },
+        },
         items: {
           type: "array",
           maxItems: 5,
@@ -177,6 +186,8 @@ const TOOLS = [
               reason: { type: "string", description: "入選理由：具體催化事件＋資料時間，一到兩句" },
               checks: { type: "array", maxItems: 8, items: { type: "string" }, description: "逐項條件檢核，每項含實際數值與 ✅／⚠️，例如「收盤 41.3 ✅」「成交金額第 18 名 ✅」「5 日均振幅 3.4% ✅」「當沖比 56% ⚠️ 超標」「注意股 ⚠️」" },
               tier: { type: "string", enum: ["main", "secondary"], description: "secondary＝有條件超標而降級的次級觀察" },
+              peers: { type: "array", maxItems: 3, items: { type: "string" }, description: "同業代號（最多 3 檔），例如欣興填 [\"8046\",\"3189\"]。同業平均跌幅 ≥ peerDropPercent 時暫停這檔的進場通知。把劇本中「同業翻黑就刪除」寫在這裡" },
+              peerDropPercent: { type: "number", description: "同業平均跌幅門檻（%），0.3–8，預設 2" },
               entries: {
                 type: "array",
                 minItems: 1,

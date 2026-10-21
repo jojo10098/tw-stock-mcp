@@ -146,7 +146,7 @@ let gap = { "2409": 0.5, "2002": 0.0 };
 let quoteCalls = 0;
 const deps = {
   getQuotes: async (_env, { symbols }) => {
-    quoteCalls++;
+    if (symbols.some((x) => x === "2409" || x === "2002")) quoteCalls++; // 只計標的查價（不含大盤保護）
     return { quotes: symbols.map((s) => ({ symbol: s, name: s, lastPrice: prices[s], tradeVolume: 50000, openGapPercent: gap[s], changePercent: 1.0, isToday: true, canDayTrade: true, matchingIntervalSeconds: 0 })) };
   },
   getDailyHistory: async (_env, { symbol }) => ({ candles: [{ date: "2026-10-20", volume: 54000 }, { date: "2026-10-19", volume: 54000 }] }),
@@ -311,7 +311,7 @@ Date.now = realNow;
     put: async (k, v) => { mem.set(k, structuredClone(v)); },
     getAlarm: async () => alarmAt, setAlarm: async (t) => { alarmAt = t; },
   } }, env);
-  mem.set("watchlist", validateWatchlist({ date: "2026-10-21", items: [{ symbol: "2409", name: "友達", invalidBelow: 19, entries: [{ id: "flat", when: "flat", priceAbove: 20.3, holdMinutes: 1 }] }] }));
+  mem.set("watchlist", validateWatchlist({ date: "2026-10-21", marketGuard: { enabled: false }, items: [{ symbol: "2409", name: "友達", invalidBelow: 19, entries: [{ id: "flat", when: "flat", priceAbove: 20.3, holdMinutes: 1 }] }] }));
   let calls = 0;
   setMonitorDeps({ getQuotes: async (_e, { symbols }) => { calls++; return { quotes: symbols.map((s) => ({ symbol: s, lastPrice: 20.4, tradeVolume: 1, openGapPercent: 0, isToday: true, canDayTrade: true, matchingIntervalSeconds: 0 })) }; }, getDailyHistory: async () => ({ candles: [] }) });
   const rn = Date.now;
@@ -326,6 +326,76 @@ Date.now = realNow;
   check("13:25 之後不再排 alarm", alarmAt === null);
   Date.now = () => at("08:30").getTime();
   check("盤前看門狗不排程", (await (await doObj.fetch(new Request("https://monitor/arm", { method: "POST" }))).json()).armed === false);
+  Date.now = rn;
+}
+
+// ---------- 保護條件：大盤、同業 ----------
+{
+  const { evalMarketGuard, evalPeerGuard, guardSymbols, guardRefreshSeconds, formatWatchlistAnnouncement: fa } = await import("../src/monitor.js");
+  const wlg = validateWatchlist({ date: "2026-10-21", items: [{ symbol: "3037", name: "欣興", peers: ["8046", "3189"], entries: [{ id: "flat", when: "flat", priceAbove: 100 }] }] });
+  check("預設啟用大盤保護（加權、台積電 1.5%）", wlg.marketGuard.enabled && wlg.marketGuard.symbols.join() === "IX0001,2330" && wlg.marketGuard.dropPercent === 1.5);
+  check("同業預設門檻 2%", wlg.items[0].peers.join() === "8046,3189" && wlg.items[0].peerDropPercent === 2);
+  check("保護條件要查的代號（去重、不含標的）", guardSymbols(wlg).join() === "IX0001,2330,8046,3189");
+  check("保護條件查價間隔：4 檔 30 秒、10 檔 40 秒", guardRefreshSeconds(4) === 30 && guardRefreshSeconds(10) === 40 && guardRefreshSeconds(0) === 0);
+  check("peers 格式錯誤 → 錯誤", throws(() => validateWatchlist({ date: "2026-10-21", items: [{ symbol: "3037", peers: ["南電"], entries: [{ when: "any", priceAbove: 1 }] }] })));
+  check("marketGuard 可關閉", validateWatchlist({ date: "2026-10-21", marketGuard: { enabled: false }, items: [] }).marketGuard.enabled === false);
+
+  const Q = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, { name: k, changePercent: v, isToday: true }]));
+  let r = evalMarketGuard(wlg.marketGuard, Q({ IX0001: -0.8, 2330: -1.2 }), false);
+  check("大盤 -0.8%、台積電 -1.2% → 不暫停", !r.paused && !r.changed);
+  r = evalMarketGuard(wlg.marketGuard, Q({ IX0001: -1.1, 2330: -1.6 }), false);
+  check("台積電 -1.6% → 暫停", r.paused && r.changed);
+  r = evalMarketGuard(wlg.marketGuard, Q({ IX0001: -0.9, 2330: -1.2 }), true);
+  check("回到 -1.2% 還不恢復（需回升 0.5 個百分點）", r.paused && !r.changed);
+  r = evalMarketGuard(wlg.marketGuard, Q({ IX0001: -0.5, 2330: -0.9 }), true);
+  check("回到 -0.9% → 恢復", !r.paused && r.changed);
+  check("查不到報價 → 維持原狀", evalMarketGuard(wlg.marketGuard, {}, true).paused === true);
+
+  let p = evalPeerGuard(wlg.items[0], Q({ 8046: -3, 3189: -1.5 }), false);
+  check("同業平均 -2.25% → 暫停", p.paused && p.changed && p.avg === -2.25);
+  p = evalPeerGuard(wlg.items[0], Q({ 8046: -1, 3189: -1 }), true);
+  check("同業回到 -1% → 恢復", !p.paused && p.changed);
+
+  // 保護中不發進場、不累計連續時間；部位仍追蹤
+  const it = wlg.items[0];
+  const st = newSymbolState();
+  const q = (px) => ({ lastPrice: px, openGapPercent: 0, isToday: true, canDayTrade: true, matchingIntervalSeconds: 0 });
+  check("保護中：條件成立也不進場", evaluateItem(it, q(101), st, { minute: 600, sec: 36000, hhmm: "x", noNewEntryMin: 750, blockEntries: true }).length === 0 && st.holdSince.flat == null);
+  check("解除後立即可進場", evaluateItem(it, q(101), st, { minute: 600, sec: 36006, hhmm: "x", noNewEntryMin: 750 }).length === 1);
+  const ev = evaluateItem(it, q(99), st, { minute: 600, sec: 36012, hhmm: "x", noNewEntryMin: 750, blockEntries: true });
+  check("保護中已進場部位仍發停損", ev.length === 1 && ev[0].type === "stop");
+
+  const txt = fa(wlg);
+  check("公告列出大盤保護與同業保護", txt.includes("🛡 大盤保護：加權指數或台積電跌逾 1.5%") && txt.includes("同業保護：8046、3189 平均跌逾 2%"));
+
+  // 端到端：大盤轉弱 → 推播暫停、阻擋進場；回穩 → 推播恢復
+  const mem = new Map(); let alarmAt = null;
+  const doObj = new WatchMonitor({ storage: {
+    get: async (k) => (mem.has(k) ? structuredClone(mem.get(k)) : undefined),
+    put: async (k, v) => { mem.set(k, structuredClone(v)); },
+    getAlarm: async () => alarmAt, setAlarm: async (t) => { alarmAt = t; },
+  } }, env);
+  mem.set("watchlist", validateWatchlist({ date: "2026-10-21", items: [{ symbol: "3037", name: "欣興", peers: ["8046"], entries: [{ id: "flat", when: "flat", priceAbove: 100 }] }] }));
+  const px = { 3037: 99, IX0001: -0.3, 2330: -1.8, 8046: 0.5 };
+  const { setMonitorDeps } = await import("../src/monitor.js");
+  let guardCalls = 0;
+  setMonitorDeps({ getDailyHistory: async () => ({ candles: [] }), getQuotes: async (_e, { symbols }) => {
+    if (symbols.includes("IX0001")) guardCalls++;
+    return { quotes: symbols.map((x) => x === "3037"
+      ? { symbol: x, name: "欣興", lastPrice: px[x], openGapPercent: 0, changePercent: 0.2, isToday: true, canDayTrade: true, matchingIntervalSeconds: 0 }
+      : { symbol: x, name: x === "IX0001" ? "加權指數" : x === "2330" ? "台積電" : "南電", changePercent: px[x], isToday: true }) };
+  } });
+  const rn = Date.now; const base = sent.length;
+  Date.now = () => at("10:00").getTime(); await doObj.alarm();
+  check("台積電 -1.8% → 推播「大盤轉弱，暫停進場」", sent.length === base + 1 && sent.at(-1).text.startsWith("⚠️ 大盤轉弱") && sent.at(-1).text.includes("台積電 -1.80%"));
+  px[3037] = 101;
+  Date.now = () => at("10:00").getTime() + 6000; await doObj.alarm();
+  check("暫停中站上觸發價 → 不發進場；保護報價 30 秒內沿用不重查", sent.length === base + 1 && guardCalls === 1);
+  px[2330] = -0.7;
+  Date.now = () => at("10:00").getTime() + 31000; await doObj.alarm();
+  check("30 秒後重查：台積電回到 -0.7% → 推播恢復，並同一輪發出進場", guardCalls === 2 && sent.at(-2).text.startsWith("✅ 大盤回穩") && sent.at(-1).text.startsWith("🟢"));
+  const stt = await watchStatus({ ...env, MONITOR: { idFromName: () => "x", get: () => ({ fetch: (u, i) => doObj.fetch(new Request(u, i)) }) } }, at("10:01"));
+  check("watchStatus 顯示大盤保護狀態", stt.marketGuard.enabled && stt.marketGuard.paused === false && stt.items[0].peers[0] === "8046");
   Date.now = rn;
 }
 
