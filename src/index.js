@@ -14,11 +14,12 @@
 const FUGLE_BASE = "https://api.fugle.tw/marketdata/v1.0/stock";
 const TWSE_BASE = "https://openapi.twse.com.tw/v1";
 const TWSE_CACHE_SECONDS = 600; // 證交所資料一天更新一次，快取 10 分鐘足夠
-import { WatchMonitor, validateWatchlist, kvGet, kvPut, formatWatchlistAnnouncement, runMonitorTick, watchStatus, sendTelegram, taipeiParts, telegramChatIds } from "./monitor.js";
+import { WatchMonitor, validateWatchlist, kvGet, kvPut, formatWatchlistAnnouncement, runMonitorTick, watchStatus, armMonitor, setMonitorDeps, sendTelegram, taipeiParts, telegramChatIds } from "./monitor.js";
 
 export { WatchMonitor };
+setMonitorDeps({ getQuotes, getDailyHistory, getMinuteHistory });
 
-const SERVER_INFO = { name: "tw-stock-mcp", version: "0.4.5" };
+const SERVER_INFO = { name: "tw-stock-mcp", version: "0.5.0" };
 const SUPPORTED_PROTOCOLS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
 const INDEX_SYMBOLS = {
@@ -153,7 +154,7 @@ const TOOLS = [
   {
     name: "set_daytrade_watchlist",
     description:
-      "【盤中監控】寫入今天的當沖監控清單（覆蓋前一份）。寫入後，伺服器會在台北時間 09:01–13:25 每分鐘查一次即時報價，條件成立時用 Telegram 通知使用者；每個條件只通知一次。最多 5 檔。每檔包含：symbol、name、prevClose（前一日收盤）、invalidBelow（失效價：現價跌到此價以下就通知失效並停止監控該檔）、entries（進場條件陣列）。每個 entry：id、label（給人看的一句話，例如「開平突破 1,270」）、when（適用開盤情境：high=跳空 +1% 以上／flat=±1% 以內／low=跳空 -1% 以下／any）、priceAbove（觸發價：現價 ≥ 此價才算成立）、holdMinutes（需連續成立幾分鐘，預設 1，建議 2–3 以減少假突破）、minVolumeRatio（選填：今日累計成交量 ÷ 近 5 日「同一時刻」的平均累計量（依實際分時量能分布，已反映開盤爆量），需 ≥ 此倍數；建議 1.3）、abandonBelow（選填：該劇本的放棄價，例如開高走低跌破某價就放棄）。另可設 noNewEntryAfter（HH:MM，預設 12:30，之後不再發進場通知）。開盤後若個股變成處置、分盤撮合或不可當沖，會自動通知失效。可附上選股條件 criteria、每檔入選理由 reason、條件檢核 checks、tier（次級觀察），會一起推播。寫入成功後會立即把今日清單推播到 Telegram（同一天重寫會標示「更新」；items 為空時推播「今日無標的」）；不想推播可設 announce=false。",
+      "【盤中監控】寫入今天的當沖監控清單（覆蓋前一份）。寫入後，伺服器會在台北時間 09:01–13:25 每數秒（依檔數自動調整，3 檔約 6 秒）查一次即時報價，條件成立時用 Telegram 通知使用者；每個條件只通知一次。最多 5 檔。每檔包含：symbol、name、prevClose（前一日收盤）、invalidBelow（失效價：現價跌到此價以下就通知失效並停止監控該檔）、entries（進場條件陣列）。每個 entry：id、label（給人看的一句話，例如「開平突破 1,270」）、when（適用開盤情境：high=跳空 +1% 以上／flat=±1% 以內／low=跳空 -1% 以下／any）、priceAbove（觸發價：現價 ≥ 此價才算成立）、holdMinutes（需連續成立幾分鐘，預設 1，建議 2–3 以減少假突破）、minVolumeRatio（選填：今日累計成交量 ÷ 近 5 日「同一時刻」的平均累計量（依實際分時量能分布，已反映開盤爆量），需 ≥ 此倍數；建議 1.3）、abandonBelow（選填：該劇本的放棄價，例如開高走低跌破某價就放棄）。另可設 noNewEntryAfter（HH:MM，預設 12:30，之後不再發進場通知）。開盤後若個股變成處置、分盤撮合或不可當沖，會自動通知失效。可附上選股條件 criteria、每檔入選理由 reason、條件檢核 checks、tier（次級觀察），會一起推播。寫入成功後會立即把今日清單推播到 Telegram（同一天重寫會標示「更新」；items 為空時推播「今日無標的」）；不想推播可設 announce=false。",
     inputSchema: {
       type: "object",
       properties: {
@@ -283,7 +284,8 @@ async function getTicker(env, symbol) {
   const cache = typeof caches !== "undefined" ? caches.default : null;
   const cacheKey = new Request(`${TICKER_CACHE_HOST}${today}/${encodeURIComponent(symbol)}`);
   if (cache) {
-    const hit = await cache.match(cacheKey);
+    // Durable Object（盤中秒級監控）內可能不支援 Cache API；失敗就略過快取，只用記憶體快取
+    const hit = await cache.match(cacheKey).catch(() => null);
     if (hit) {
       const t = await hit.json();
       tickerMemo.set(memoKey, t);
@@ -302,7 +304,7 @@ async function getTicker(env, symbol) {
     const ttl = isToday ? 12 * 3600 : 300;
     await cache.put(cacheKey, new Response(JSON.stringify(t), {
       headers: { "content-type": "application/json", "cache-control": `max-age=${ttl}` },
-    }));
+    })).catch(() => null);
   }
   return t;
 }
@@ -729,6 +731,7 @@ async function setDaytradeWatchlist(env, args) {
   const prev = await kvGet(env, "watchlist");
   await kvPut(env, "watchlist", wl);
   await kvPut(env, `state:${wl.date}`, null);
+  await armMonitor(env).catch(() => null); // 盤中改清單時立即接手秒級檢查
 
   // 寫入後把今日清單推播到 Telegram（私訊／頻道）；同一天再次寫入會標示「更新」
   let announced = null;
@@ -743,7 +746,7 @@ async function setDaytradeWatchlist(env, args) {
     items: wl.items.map((it) => `${it.symbol} ${it.name}：${it.entries.length} 個條件，失效價 ${it.invalidBelow ?? "未設"}`),
     noNewEntryAfter: wl.noNewEntryAfter,
     telegramConfigured: Boolean(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID),
-    note: "監控時段為台北 09:01–13:25，每分鐘檢查一次；13:15 會對已觸發的標的發平倉提醒。",
+    note: "監控時段為台北 09:01–13:25，每數秒檢查一次；進場通知後會追蹤停損（-1%）、第一目標（+0.6%）與保本；13:15 會對未出場的標的發平倉提醒。",
   };
 }
 
@@ -793,7 +796,7 @@ async function handleRpc(env, msg) {
         capabilities: { tools: { listChanged: false } },
         serverInfo: SERVER_INFO,
         instructions:
-          "台股行情。富果 API（上市上櫃皆可，每分鐘 60 次額度）：查價、漲跌停與可否現沖用 get_quotes；大盤背景用 get_market_overview；開盤後走勢與量能用 get_intraday_candles；近 N 日量價、振幅、均線用 get_daily_history。證交所 OpenAPI（前一交易日盤後資料，僅上市股票，不吃富果額度）：當沖前先用 get_daytrade_status 確認可否當沖、是否注意／處置；個股融資融券用 get_margin_trading；估值用 get_valuation；全部注意／處置股用 get_alert_lists。注意時段：開盤前或休市日，盤中工具回傳的是最近一個交易日資料，請看 isToday／date。盤中監控：set_daytrade_watchlist 寫入當日當沖條件後，伺服器每分鐘自動檢查並以 Telegram 通知；get_daytrade_watchlist 查看狀態。所有工具的個股成交量單位一律為「張」，成交金額為「元」；所有時間為台北時間。",
+          "台股行情。富果 API（上市上櫃皆可，每分鐘 60 次額度）：查價、漲跌停與可否現沖用 get_quotes；大盤背景用 get_market_overview；開盤後走勢與量能用 get_intraday_candles；近 N 日量價、振幅、均線用 get_daily_history。證交所 OpenAPI（前一交易日盤後資料，僅上市股票，不吃富果額度）：當沖前先用 get_daytrade_status 確認可否當沖、是否注意／處置；個股融資融券用 get_margin_trading；估值用 get_valuation；全部注意／處置股用 get_alert_lists。注意時段：開盤前或休市日，盤中工具回傳的是最近一個交易日資料，請看 isToday／date。盤中監控：set_daytrade_watchlist 寫入當日當沖條件後，伺服器每數秒自動檢查並以 Telegram 通知（含進場後的停損、第一目標與保本通知）；get_daytrade_watchlist 查看狀態。所有工具的個股成交量單位一律為「張」，成交金額為「元」；所有時間為台北時間。",
       });
     }
     case "ping":
@@ -839,11 +842,13 @@ function json(body, status = 200, extra = {}) {
 }
 
 export default {
+  // Cron 每分鐘一次：只當看門狗，確保 Durable Object 的秒級 alarm 在盤中持續運作；
+  // 實際檢查由 WatchMonitor.alarm() 每 N 秒執行（N 依檔數自動調整，見 checkIntervalSeconds）
   async scheduled(event, env, ctx) {
     ctx.waitUntil(
-      runMonitorTick(env, new Date(event.scheduledTime), { getQuotes, getDailyHistory, getMinuteHistory })
-        .then((r) => console.log(JSON.stringify({ monitor: r })))
-        .catch((e) => console.log(JSON.stringify({ monitorError: e.message })))
+      armMonitor(env)
+        .then((r) => console.log(JSON.stringify({ monitorArm: r })))
+        .catch((e) => console.log(JSON.stringify({ monitorArmError: e.message })))
     );
   },
 

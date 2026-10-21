@@ -17,7 +17,9 @@ export function taipeiParts(date = new Date(Date.now())) {
   return {
     date: t.toISOString().slice(0, 10),
     minute: t.getUTCHours() * 60 + t.getUTCMinutes(), // 當日第幾分鐘
+    sec: t.getUTCHours() * 3600 + t.getUTCMinutes() * 60 + t.getUTCSeconds(), // 當日第幾秒
     hhmm: t.toISOString().slice(11, 16),
+    hhmmss: t.toISOString().slice(11, 19),
     weekday: t.getUTCDay(), // 0=日
   };
 }
@@ -31,6 +33,16 @@ const OPEN_MIN = 9 * 60; // 09:00
 const SESSION_MINUTES = 270; // 09:00–13:30
 const CLOSE_REMINDER_MIN = 13 * 60 + 15; // 13:15 提醒平倉
 const LAST_CHECK_MIN = 13 * 60 + 25;
+
+// 檢查間隔：依監控檔數自動調整，讓監控最多用掉富果即時額度（60 次／分）的一半，
+// 其餘留給晨報、盤中檢查與手動查價。可用環境變數微調：
+//   MONITOR_INTERVAL_SECONDS（最短間隔，預設 5 秒）、MONITOR_QUOTA_PER_MIN（監控可用額度，預設 30）
+export function checkIntervalSeconds(env, symbolCount) {
+  const floor = Math.max(3, Number(env?.MONITOR_INTERVAL_SECONDS) || 5);
+  const budget = Math.min(55, Math.max(6, Number(env?.MONITOR_QUOTA_PER_MIN) || 30));
+  const n = Math.max(1, symbolCount || 1);
+  return Math.min(60, Math.max(floor, Math.ceil((n * 60) / budget)));
+}
 
 // ---------------------------------------------------------------------------
 // 台股升降單位
@@ -209,21 +221,42 @@ export function validateWatchlist(input) {
 // ---------------------------------------------------------------------------
 
 export function newSymbolState() {
-  return { invalidated: false, fired: {}, abandoned: {}, holdSince: {}, log: [] };
+  return { invalidated: false, fired: {}, abandoned: {}, holdSince: {}, positions: {}, log: [] };
 }
 
 /**
  * @param item   清單中的一檔
  * @param quote  get_quotes 的單檔結果
  * @param st     該檔狀態（會被修改）
- * @param ctx    { minute, hhmm, noNewEntryMin, volBase }（volBase 來自 buildVolumeProfile 或 {method:"linear",avgVol5}）
- * @returns 事件陣列：{ type: "entry"|"invalid"|"abandon", ... }
+ * @param ctx    { minute, sec, hhmm, noNewEntryMin, volBase }（volBase 來自 buildVolumeProfile 或 {method:"linear",avgVol5}）
+ * @returns 事件陣列：{ type: "entry"|"invalid"|"abandon"|"stop"|"target"|"breakeven", ... }
  */
 export function evaluateItem(item, quote, st, ctx) {
   const events = [];
-  if (st.invalidated || !quote || quote.error || quote.isToday === false) return events;
+  if (!quote || quote.error || quote.isToday === false) return events;
   const price = quote.lastPrice;
   if (price == null) return events;
+  st.positions ??= {};
+  const nowSec = ctx.sec ?? ctx.minute * 60;
+
+  // 已發出進場通知的部位：追蹤停損、第一目標、保本（即使該檔之後失效也繼續追蹤）
+  for (const [id, pos] of Object.entries(st.positions)) {
+    if (pos.status === "open" && price <= pos.stop) {
+      pos.status = "closed";
+      pos.exit = { type: "stop", at: ctx.hhmm, price };
+      events.push({ type: "stop", pos, price });
+    } else if (pos.status === "open" && price >= pos.target) {
+      pos.status = "target";
+      pos.targetAt = { at: ctx.hhmm, price };
+      events.push({ type: "target", pos, price });
+    } else if (pos.status === "target" && price <= pos.entryPrice) {
+      pos.status = "closed";
+      pos.exit = { type: "breakeven", at: ctx.hhmm, price };
+      events.push({ type: "breakeven", pos, price });
+    }
+  }
+  if (st.invalidated) return events;
+  const tracking = Object.values(st.positions).some((p) => p.status !== "closed");
 
   // 交易限制變化：處置、分盤撮合、不可當沖 → 直接失效
   const blocked =
@@ -233,13 +266,13 @@ export function evaluateItem(item, quote, st, ctx) {
           : null;
   if (blocked) {
     st.invalidated = true;
-    events.push({ type: "invalid", reason: blocked, price });
+    events.push({ type: "invalid", reason: blocked, price, tracking });
     return events;
   }
 
   if (item.invalidBelow != null && price <= item.invalidBelow) {
     st.invalidated = true;
-    events.push({ type: "invalid", reason: `跌破失效價 ${item.invalidBelow}`, price });
+    events.push({ type: "invalid", reason: `跌破失效價 ${item.invalidBelow}`, price, tracking });
     return events;
   }
 
@@ -270,10 +303,13 @@ export function evaluateItem(item, quote, st, ctx) {
       delete st.holdSince[e.id];
       continue;
     }
-    if (st.holdSince[e.id] == null) st.holdSince[e.id] = ctx.minute;
-    if (ctx.minute - st.holdSince[e.id] + 1 >= e.holdMinutes) {
+    // 「連續成立 N 分鐘」：從第一次成立起算，持續 (N−1)×60 秒仍成立就觸發（N=1 為立即觸發）
+    if (st.holdSince[e.id] == null) st.holdSince[e.id] = nowSec;
+    if (nowSec - st.holdSince[e.id] >= (e.holdMinutes - 1) * 60) {
+      const levels = exitLevels(price);
       st.fired[e.id] = { at: ctx.hhmm, price };
-      events.push({ type: "entry", entry: e, price, scenario, volRatio, volMethod, volDays, levels: exitLevels(price) });
+      st.positions[e.id] = { id: e.id, label: e.label, entryPrice: price, stop: levels.stop, target: levels.target, at: ctx.hhmm, status: "open" };
+      events.push({ type: "entry", entry: e, price, scenario, volRatio, volMethod, volDays, levels });
     }
   }
   return events;
@@ -307,7 +343,30 @@ export function formatEvent(item, quote, ev, hhmm) {
     ].join("\n");
   }
   if (ev.type === "invalid") {
-    return `🔴 失效｜${title}\n${ev.reason}（現價 ${fmt(ev.price)}，${hhmm}），今日停止監控這一檔。`;
+    const more = ev.tracking ? "\n已發出的進場部位仍會繼續追蹤停損與目標。" : "";
+    return `🔴 失效｜${title}\n${ev.reason}（現價 ${fmt(ev.price)}，${hhmm}），今日不再發新的進場通知。${more}`;
+  }
+  if (ev.type === "stop") {
+    const p = ev.pos;
+    const loss = Math.round((p.entryPrice - ev.price) * 1000);
+    return [
+      `🛑 跌破停損｜${title}`,
+      `${p.at} 進場通知價 ${fmt(p.entryPrice)}（${p.label}）`,
+      `現價 ${fmt(ev.price)}（${hhmm}）已跌破停損 ${fmt(p.stop)}`,
+      `若有部位請出場：每張約虧 ${fmt(loss)} 元＋來回成本。今天這檔不再追。`,
+    ].join("\n");
+  }
+  if (ev.type === "target") {
+    const p = ev.pos;
+    return [
+      `🎯 達第一目標｜${title}`,
+      `${p.at} 進場通知價 ${fmt(p.entryPrice)}，現價 ${fmt(ev.price)}（${hhmm}）已達目標 ${fmt(p.target)}（+0.6%）`,
+      `若有部位：先減半；剩餘停損上移到進場價 ${fmt(p.entryPrice)}（保本），跌回會再通知。`,
+    ].join("\n");
+  }
+  if (ev.type === "breakeven") {
+    const p = ev.pos;
+    return `⚪ 回到進場價｜${title}\n現價 ${fmt(ev.price)}（${hhmm}）回落至進場價 ${fmt(p.entryPrice)}，剩餘部位保本出場。`;
   }
   if (ev.type === "abandon") {
     return `⚪ 劇本放棄｜${title}\n${SCENARIO_LABEL[ev.scenario]}劇本「${ev.entry.label}」跌破 ${fmt(ev.entry.abandonBelow)}（現價 ${fmt(ev.price)}，${hhmm}）。`;
@@ -397,12 +456,57 @@ async function sendOne(env, chatId, text) {
 // Durable Object：簡單的 key-value 儲存
 // ---------------------------------------------------------------------------
 
+let MONITOR_DEPS = null;
+/** index.js 啟動時注入行情函式（getQuotes／getDailyHistory／getMinuteHistory），供 Durable Object 的 alarm 使用 */
+export function setMonitorDeps(deps) {
+  MONITOR_DEPS = deps;
+}
+
+/** 現在是否在需要排程檢查的時段（平日 09:00–13:25） */
+function inSession(now) {
+  const t = taipeiParts(now);
+  return t.weekday >= 1 && t.weekday <= 5 && t.minute >= OPEN_MIN && t.minute <= LAST_CHECK_MIN;
+}
+
 export class WatchMonitor {
-  constructor(state) {
+  constructor(state, env) {
+    this.state = state;
     this.storage = state.storage;
+    this.env = env;
   }
+
+  // 盤中每 N 秒一次：alarm 執行檢查後再排下一次；Cron 每分鐘呼叫 /arm 當看門狗
+  async alarm() {
+    const now = new Date(Date.now());
+    let n = 1;
+    let hasList = false;
+    try {
+      const store = { get: (k) => this.storage.get(k), put: (k, v) => this.storage.put(k, v) };
+      const wl = await this.storage.get("watchlist");
+      n = wl?.items?.length || 1;
+      hasList = wl?.date === taipeiParts(now).date && wl.items?.length > 0;
+      if (MONITOR_DEPS) await runMonitorTick(this.env, now, { ...MONITOR_DEPS, store });
+    } catch (e) {
+      console.log(JSON.stringify({ alarmError: String(e?.message ?? e) }));
+    }
+    const next = Date.now() + checkIntervalSeconds(this.env, n) * 1000;
+    if (hasList && inSession(new Date(next))) await this.storage.setAlarm(next);
+  }
+
+  async arm() {
+    if (!inSession(new Date(Date.now()))) return { armed: false, reason: "outside_session" };
+    const wl = await this.storage.get("watchlist");
+    if (!wl || wl.date !== taipeiParts().date || !wl.items?.length) return { armed: false, reason: "no_watchlist_today" };
+    const cur = await this.storage.getAlarm();
+    const interval = checkIntervalSeconds(this.env, wl.items.length);
+    // 沒有排程，或排程時間異常（太遠）時重新排
+    if (cur == null || cur > Date.now() + (interval + 5) * 1000) await this.storage.setAlarm(Date.now() + 200);
+    return { armed: true, intervalSeconds: interval, nextAt: await this.storage.getAlarm() };
+  }
+
   async fetch(request) {
     const url = new URL(request.url);
+    if (url.pathname === "/arm") return new Response(JSON.stringify(await this.arm()), { headers: { "content-type": "application/json" } });
     const key = decodeURIComponent(url.pathname.replace(/^\/kv\//, ""));
     if (!key || !url.pathname.startsWith("/kv/")) return new Response("bad path", { status: 400 });
     if (request.method === "GET") {
@@ -426,6 +530,13 @@ export async function kvGet(env, key) {
   return r.json();
 }
 
+/** Cron 每分鐘呼叫：確保盤中秒級檢查的排程在運作 */
+export async function armMonitor(env) {
+  if (!env.MONITOR) return { armed: false, reason: "no_monitor_binding" };
+  const r = await stub(env).fetch("https://monitor/arm", { method: "POST" });
+  return r.json();
+}
+
 export async function kvPut(env, key, value) {
   await stub(env).fetch(`https://monitor/kv/${encodeURIComponent(key)}`, {
     method: "PUT",
@@ -441,17 +552,20 @@ export async function kvPut(env, key, value) {
  * @param deps { getQuotes(env,{symbols}), getDailyHistory(env,{symbol,days}) }
  */
 export async function runMonitorTick(env, now, deps) {
-  if (!env.MONITOR) return { skipped: "no_monitor_binding" };
+  const store = deps.store ?? (env.MONITOR ? { get: (k) => kvGet(env, k), put: (k, v) => kvPut(env, k, v) } : null);
+  if (!store) return { skipped: "no_monitor_binding" };
   const t = taipeiParts(now);
   if (t.weekday === 0 || t.weekday === 6) return { skipped: "weekend" };
   if (t.minute < OPEN_MIN + 1 || t.minute > LAST_CHECK_MIN) return { skipped: "outside_session", hhmm: t.hhmm };
 
-  const wl = await kvGet(env, "watchlist");
+  const wl = await store.get("watchlist");
   if (!wl || wl.date !== t.date || !wl.items?.length) return { skipped: "no_watchlist_today", date: t.date };
 
-  const state = (await kvGet(env, `state:${t.date}`)) ?? { symbols: {}, reminded: false, sent: [] };
+  const state = (await store.get(`state:${t.date}`)) ?? { symbols: {}, reminded: false, sent: [] };
   state.volBase ??= {};
-  const active = wl.items.filter((it) => !state.symbols[it.symbol]?.invalidated);
+  // 失效的標的不再查價，但若還有未出場的進場部位，仍要繼續追蹤停損
+  const openPos = (st) => Object.values(st?.positions ?? {}).some((p) => p.status !== "closed");
+  const active = wl.items.filter((it) => !state.symbols[it.symbol]?.invalidated || openPos(state.symbols[it.symbol]));
 
   // 量能基準：每天每檔只建一次。優先用近 5 日 1 分 K 的實際分時累計量；
   // 分 K 取不到或不足 3 天時，退回「近 5 日均量 × 經過時間比例」的線性估算。
@@ -486,29 +600,31 @@ export async function runMonitorTick(env, now, deps) {
     for (const it of active) {
       const st = (state.symbols[it.symbol] ??= newSymbolState());
       const quote = bySym[it.symbol];
-      const events = evaluateItem(it, quote, st, { minute: t.minute, hhmm: t.hhmm, noNewEntryMin, volBase: state.volBase[it.symbol] });
+      const events = evaluateItem(it, quote, st, { minute: t.minute, sec: t.sec, hhmm: t.hhmmss, noNewEntryMin, volBase: state.volBase[it.symbol] });
       for (const ev of events) {
-        st.log.push({ at: t.hhmm, type: ev.type, id: ev.entry?.id ?? null, price: ev.price });
-        messages.push(formatEvent(it, quote, ev, t.hhmm));
+        st.log.push({ at: t.hhmmss, type: ev.type, id: ev.entry?.id ?? ev.pos?.id ?? null, price: ev.price });
+        messages.push(formatEvent(it, quote, ev, t.hhmmss));
       }
     }
   }
 
   // 13:15 平倉提醒（只有今天有發出進場通知時）
-  const firedList = Object.entries(state.symbols).flatMap(([sym, st]) => Object.keys(st.fired).map(() => sym));
+  const firedList = Object.entries(state.symbols).flatMap(([sym, st]) =>
+    Object.values(st.positions ?? {}).filter((p) => p.status !== "closed").map(() => sym));
   if (!state.reminded && t.minute >= CLOSE_REMINDER_MIN && firedList.length) {
     state.reminded = true;
     const names = [...new Set(firedList)].map((s) => `${s} ${wl.items.find((i) => i.symbol === s)?.name ?? ""}`.trim());
-    messages.push(`⏰ 13:15 平倉提醒\n今天有發出進場通知：${names.join("、")}\n若有部位，13:20 前一律平倉，不留倉、不轉現股。`);
+    messages.push(`⏰ 13:15 平倉提醒\n尚未出場的進場通知：${names.join("、")}\n若有部位，13:20 前一律平倉，不留倉、不轉現股。`);
   }
 
   for (const text of messages) {
     const r = await sendTelegram(env, text);
-    state.sent.push({ at: t.hhmm, ok: r.ok, reason: r.ok ? undefined : r.reason, preview: text.split("\n")[0] });
+    state.sent.push({ at: t.hhmmss, ok: r.ok, reason: r.ok ? undefined : r.reason, preview: text.split("\n")[0] });
   }
   if (state.sent.length > 100) state.sent = state.sent.slice(-100);
-  await kvPut(env, `state:${t.date}`, state);
-  return { ran: true, hhmm: t.hhmm, checked: active.length, messages: messages.length };
+  state.lastCheck = t.hhmmss;
+  await store.put(`state:${t.date}`, state);
+  return { ran: true, hhmm: t.hhmmss, checked: active.length, messages: messages.length };
 }
 
 /** 給 MCP 工具與診斷用：今日清單與狀態摘要 */
@@ -522,6 +638,8 @@ export async function watchStatus(env, now = new Date(Date.now())) {
     watchlistDate: wl?.date ?? null,
     activeToday: wl?.date === t.date,
     noNewEntryAfter: wl?.noNewEntryAfter ?? null,
+    checkIntervalSeconds: checkIntervalSeconds(env, wl?.items?.length || 1),
+    lastCheck: state?.lastCheck ?? null,
     telegramConfigured: Boolean(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID),
     items: (wl?.items ?? []).map((it) => {
       const st = state?.symbols?.[it.symbol];
@@ -548,6 +666,10 @@ export async function watchStatus(env, now = new Date(Date.now())) {
           status: st?.fired?.[e.id] ? `已觸發 ${st.fired[e.id].at} @ ${st.fired[e.id].price}` : st?.abandoned?.[e.id] ? "已放棄" : "監控中",
         })),
         invalidated: st?.invalidated ?? false,
+        positions: Object.values(st?.positions ?? {}).map((p) => ({
+          id: p.id, label: p.label, entryAt: p.at, entryPrice: p.entryPrice, stop: p.stop, target: p.target,
+          status: p.status === "open" ? "持有中（追蹤停損／目標）" : p.status === "target" ? "已達第一目標，剩餘保本追蹤" : `已結束（${p.exit?.type === "stop" ? "停損" : "保本"} ${p.exit?.at} @ ${p.exit?.price}）`,
+        })),
         log: st?.log ?? [],
       };
     }),

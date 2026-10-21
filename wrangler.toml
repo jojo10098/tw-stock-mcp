@@ -21,7 +21,7 @@ class_name = "WatchMonitor"
 tag = "v1"
 new_sqlite_classes = ["WatchMonitor"]
 
-# 每分鐘執行；UTC 01:00–05:59 = 台北 09:00–13:59，平日。程式內再限縮到 09:01–13:25
+# 每分鐘執行的看門狗；UTC 01:00–05:59 = 台北 09:00–13:59，平日。實際檢查由 Durable Object alarm 每數秒執行，限縮在 09:01–13:25
 [triggers]
 crons = ["* 1-5 * * 1-5"]
 

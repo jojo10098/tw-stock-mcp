@@ -217,21 +217,21 @@ check("友達第 2 分鐘 → 通知", sent.length === 2 && sent[1].text.include
 check("通知含停損與目標", /停損 20\.15/.test(sent[1].text) && /第一目標 20\.5/.test(sent[1].text));
 prices["2002"] = 21.5;
 await runMonitorTick(env, at("10:00"), deps);
-check("中鋼跌破失效價 → 失效通知", sent.length === 3 && sent[2].text.startsWith("🔴 失效｜2002"));
+check("中鋼進場後跌破停損 → 停損通知，同時跌破失效價 → 失效通知", sent.length === 4 && sent[2].text.startsWith("🛑 跌破停損｜2002") && /停損 22\.05/.test(sent[2].text) && sent[3].text.startsWith("🔴 失效｜2002"));
 const callsBefore = quoteCalls;
 await runMonitorTick(env, at("10:01"), deps);
-check("失效的標的不再查價（只剩 1 檔）", quoteCalls === callsBefore + 1 && sent.length === 3);
+check("失效且已出場的標的不再查價（只剩 1 檔）", quoteCalls === callsBefore + 1 && sent.length === 4);
 await runMonitorTick(env, at("13:15"), deps);
-check("13:15 平倉提醒", sent.length === 4 && sent[3].text.includes("平倉提醒") && sent[3].text.includes("友達"));
+check("13:15 平倉提醒（只列未出場的友達）", sent.length === 5 && sent[4].text.includes("平倉提醒") && sent[4].text.includes("友達") && !sent[4].text.includes("中鋼"));
 await runMonitorTick(env, at("13:16"), deps);
-check("平倉提醒只發一次", sent.length === 4);
+check("平倉提醒只發一次", sent.length === 5);
 check("13:26 之後不執行", (await runMonitorTick(env, at("13:26"), deps)).skipped === "outside_session");
 
 Date.now = () => at("13:20").getTime();
 const status = await watchStatus(env, at("13:20"));
 check("量能基準：友達用分時曲線、中鋼退回線性", /實際分時/.test(status.items[0].volumeBaseline) && /線性/.test(status.items[1].volumeBaseline));
 check("分 K 每天每檔只查一次", minuteCalls === 2);
-check("watchStatus 狀態正確", status.activeToday && status.items[0].entries[0].status.startsWith("已觸發 09:07") && status.items[1].invalidated && status.notifications.length === 4);
+check("watchStatus 狀態正確", status.activeToday && status.items[0].entries[0].status.startsWith("已觸發 09:07") && status.items[1].invalidated && status.notifications.length === 5 && /停損/.test(status.items[1].positions[0].status) && /持有中/.test(status.items[0].positions[0].status));
 const getRes = await (await worker.fetch(new Request(`https://x.dev/mcp/${TOKEN}`, { method: "POST", body: JSON.stringify({
   jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "get_daytrade_watchlist", arguments: {} } }) }), env)).json();
 check("MCP get_daytrade_watchlist", JSON.parse(getRes.result.content[0].text).items.length === 2);
@@ -268,5 +268,65 @@ check("/notify-test 錯誤 token 拒絕", (await (await worker.fetch(new Request
 const noTg = await runMonitorTick({ ...env, TELEGRAM_BOT_TOKEN: undefined }, at("13:00"), deps);
 check("未設定 Telegram 時不會出錯", noTg.ran === true);
 Date.now = realNow;
+
+// ---------- 秒級檢查與部位追蹤 ----------
+{
+  const { checkIntervalSeconds, setMonitorDeps } = await import("../src/monitor.js");
+  check("間隔：1 檔 5 秒、3 檔 6 秒、5 檔 10 秒", checkIntervalSeconds({}, 1) === 5 && checkIntervalSeconds({}, 3) === 6 && checkIntervalSeconds({}, 5) === 10);
+  check("間隔可用環境變數調整", checkIntervalSeconds({ MONITOR_INTERVAL_SECONDS: "15" }, 3) === 15 && checkIntervalSeconds({ MONITOR_QUOTA_PER_MIN: "45" }, 3) === 5);
+
+  const it = validateWatchlist({ date: "2026-10-21", items: [{ symbol: "2409", invalidBelow: 19, entries: [{ id: "flat", when: "flat", priceAbove: 20, holdMinutes: 2 }] }] }).items[0];
+  const q = (p) => ({ lastPrice: p, tradeVolume: 1, openGapPercent: 0, isToday: true, canDayTrade: true, matchingIntervalSeconds: 0 });
+  const st = newSymbolState();
+  const c = (sec) => ({ minute: Math.floor(sec / 60), sec, hhmm: "x", noNewEntryMin: 750 });
+  const T = 600 * 60; // 10:00:00
+  check("連續 2 分鐘：第 0 秒成立不觸發", evaluateItem(it, q(20.1), st, c(T)).length === 0);
+  check("連續 2 分鐘：第 54 秒仍不觸發", evaluateItem(it, q(20.1), st, c(T + 54)).length === 0);
+  let ev = evaluateItem(it, q(20.1), st, c(T + 60));
+  check("連續 2 分鐘：滿 60 秒觸發進場並建立部位", ev.length === 1 && ev[0].type === "entry" && st.positions.flat.stop === 19.9 && st.positions.flat.target === 20.25);
+  ev = evaluateItem(it, q(20.25), st, c(T + 66));
+  check("達第一目標 → 🎯 通知", ev.length === 1 && ev[0].type === "target" && formatEvent({ symbol: "2409", name: "友達" }, {}, ev[0], "10:01:06").startsWith("🎯 達第一目標"));
+  check("目標只通知一次", evaluateItem(it, q(20.3), st, c(T + 72)).length === 0);
+  ev = evaluateItem(it, q(20.1), st, c(T + 78));
+  check("達標後跌回進場價 → 保本通知", ev.length === 1 && ev[0].type === "breakeven");
+  check("保本後不再通知", evaluateItem(it, q(19.5), st, c(T + 84)).length === 0);
+
+  const st2 = newSymbolState();
+  evaluateItem(it, q(20.1), st2, c(T)); evaluateItem(it, q(20.1), st2, c(T + 60));
+  ev = evaluateItem(it, q(18.9), st2, c(T + 66));
+  check("進場後急殺：停損與失效同時通知，失效訊息不再說還在追蹤（已出場）", ev.length === 2 && ev[0].type === "stop" && ev[1].type === "invalid" && !ev[1].tracking);
+  const st3 = newSymbolState();
+  const it3 = validateWatchlist({ date: "2026-10-21", items: [{ symbol: "2409", invalidBelow: 20.05, entries: [{ id: "flat", when: "flat", priceAbove: 20.5 }] }] }).items[0];
+  evaluateItem(it3, q(20.5), st3, c(T));
+  ev = evaluateItem(it3, q(20.4), st3, { ...c(T + 6), }); // 未破停損 20.3
+  ev = evaluateItem(it3, { ...q(20.4), isDisposition: true }, st3, c(T + 12));
+  check("進場後變處置 → 失效但持續追蹤部位", ev.length === 1 && ev[0].type === "invalid" && ev[0].tracking === true);
+  ev = evaluateItem(it3, q(20.3), st3, c(T + 18));
+  check("失效後仍會發停損通知", ev.length === 1 && ev[0].type === "stop");
+
+  // Durable Object alarm 流程（假 storage）
+  const mem = new Map(); let alarmAt = null;
+  const doObj = new WatchMonitor({ storage: {
+    get: async (k) => (mem.has(k) ? structuredClone(mem.get(k)) : undefined),
+    put: async (k, v) => { mem.set(k, structuredClone(v)); },
+    getAlarm: async () => alarmAt, setAlarm: async (t) => { alarmAt = t; },
+  } }, env);
+  mem.set("watchlist", validateWatchlist({ date: "2026-10-21", items: [{ symbol: "2409", name: "友達", invalidBelow: 19, entries: [{ id: "flat", when: "flat", priceAbove: 20.3, holdMinutes: 1 }] }] }));
+  let calls = 0;
+  setMonitorDeps({ getQuotes: async (_e, { symbols }) => { calls++; return { quotes: symbols.map((s) => ({ symbol: s, lastPrice: 20.4, tradeVolume: 1, openGapPercent: 0, isToday: true, canDayTrade: true, matchingIntervalSeconds: 0 })) }; }, getDailyHistory: async () => ({ candles: [] }) });
+  const rn = Date.now;
+  Date.now = () => at("10:00").getTime();
+  const armRes = await (await doObj.fetch(new Request("https://monitor/arm", { method: "POST" }))).json();
+  check("Cron 看門狗：盤中有清單 → 排 alarm", armRes.armed === true && alarmAt != null && armRes.intervalSeconds === 5);
+  const before = sent.length;
+  await doObj.alarm();
+  check("alarm 執行檢查並排下一次（5 秒後）", calls === 1 && sent.length === before + 1 && sent.at(-1).text.startsWith("🟢") && alarmAt === at("10:00").getTime() + 5000);
+  Date.now = () => at("13:25").getTime() + 58000;
+  alarmAt = null; await doObj.alarm();
+  check("13:25 之後不再排 alarm", alarmAt === null);
+  Date.now = () => at("08:30").getTime();
+  check("盤前看門狗不排程", (await (await doObj.fetch(new Request("https://monitor/arm", { method: "POST" }))).json()).armed === false);
+  Date.now = rn;
+}
 
 process.exit(failed ? 1 : 0);
