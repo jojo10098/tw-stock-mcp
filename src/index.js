@@ -19,7 +19,7 @@ import { WatchMonitor, validateWatchlist, kvGet, kvPut, formatWatchlistAnnouncem
 export { WatchMonitor };
 setMonitorDeps({ getQuotes, getDailyHistory, getMinuteHistory });
 
-const SERVER_INFO = { name: "tw-stock-mcp", version: "0.6.0" };
+const SERVER_INFO = { name: "tw-stock-mcp", version: "0.7.0" };
 const SUPPORTED_PROTOCOLS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
 const INDEX_SYMBOLS = {
@@ -154,7 +154,7 @@ const TOOLS = [
   {
     name: "set_daytrade_watchlist",
     description:
-      "【盤中監控】寫入今天的當沖監控清單（覆蓋前一份）。寫入後，伺服器會在台北時間 09:01–13:25 每數秒（依檔數自動調整，3 檔約 6 秒）查一次即時報價，條件成立時用 Telegram 通知使用者；每個條件只通知一次。最多 5 檔。每檔包含：symbol、name、prevClose（前一日收盤）、invalidBelow（失效價：現價跌到此價以下就通知失效並停止監控該檔）、entries（進場條件陣列）。每個 entry：id、label（給人看的一句話，例如「開平突破 1,270」）、when（適用開盤情境：high=跳空 +1% 以上／flat=±1% 以內／low=跳空 -1% 以下／any）、priceAbove（觸發價：現價 ≥ 此價才算成立）、holdMinutes（需連續成立幾分鐘，預設 1，建議 2–3 以減少假突破）、minVolumeRatio（選填：今日累計成交量 ÷ 近 5 日「同一時刻」的平均累計量（依實際分時量能分布，已反映開盤爆量），需 ≥ 此倍數；建議 1.3）、abandonBelow（選填：該劇本的放棄價，例如開高走低跌破某價就放棄）。另可設 noNewEntryAfter（HH:MM，預設 12:30，之後不再發進場通知）。開盤後若個股變成處置、分盤撮合或不可當沖，會自動通知失效。可附上選股條件 criteria、每檔入選理由 reason、條件檢核 checks、tier（次級觀察），會一起推播。保護條件：marketGuard（大盤／台積電跌逾 X% 暫停全部進場，預設啟用 1.5%）與每檔 peers（同業平均跌逾 X% 暫停該檔），由伺服器即時判斷並推播暫停／恢復；已進場部位不受影響、照常追蹤停損。寫入成功後會立即把今日清單推播到 Telegram（同一天重寫會標示「更新」；items 為空時推播「今日無標的」）；不想推播可設 announce=false。",
+      "【盤中監控】寫入今天的當沖監控清單（覆蓋前一份）。寫入後，伺服器會在台北時間 09:01–13:25 每數秒（依檔數自動調整，3 檔約 6 秒）查一次即時報價，條件成立時用 Telegram 通知使用者；每個條件只通知一次。最多 5 檔。每檔包含：symbol、name、prevClose（前一日收盤）、invalidBelow（失效價：現價跌到此價以下就通知失效並停止監控該檔）、entries（進場條件陣列）。每個 entry：id、label（給人看的一句話，例如「開平突破 1,270」）、when（適用開盤情境：high=跳空 +1% 以上／flat=±1% 以內／low=跳空 -1% 以下／any）、priceAbove（觸發價：現價 ≥ 此價才算成立）、holdMinutes（需連續成立幾分鐘，預設 1，建議 2–3 以減少假突破）、minVolumeRatio（選填：今日累計成交量 ÷ 近 5 日「同一時刻」的平均累計量（依實際分時量能分布，已反映開盤爆量），需 ≥ 此倍數；建議 1.3）、abandonBelow（選填：該劇本的放棄價，例如開高走低跌破某價就放棄）。空方（做空當沖）：該檔加 side:\"short\"，失效價改用 invalidAbove（現價漲到此價以上就失效），entry 改用 priceBelow（現價 ≤ 此價才算成立）與 abandonAbove（開低走高漲破某價就放棄）；進場後追蹤停損 +1%、第一目標 -0.6% 與保本，距漲停 2% 內會通知立刻回補；被暫停先賣後買的上市股會被拒絕寫入。另可設 noNewEntryAfter（HH:MM，預設 12:30，之後不再發進場通知）。開盤後若個股變成處置、分盤撮合或不可當沖，會自動通知失效。可附上選股條件 criteria、每檔入選理由 reason、條件檢核 checks、tier（次級觀察），會一起推播。保護條件：marketGuard（大盤／台積電跌逾 X% 暫停做多進場、漲逾 X% 暫停做空進場，預設啟用，兩邊都是 1.5%）與每檔 peers（多方：同業平均跌逾 X% 暫停該檔；空方：同業平均漲逾 X% 暫停該檔），由伺服器即時判斷並推播暫停／恢復；已進場部位不受影響、照常追蹤停損。寫入成功後會立即把今日清單推播到 Telegram（同一天重寫會標示「更新」；items 為空時推播「今日無標的」）；不想推播可設 announce=false。",
     inputSchema: {
       type: "object",
       properties: {
@@ -165,11 +165,12 @@ const TOOLS = [
         noPickReason: { type: "string", description: "items 為空時：哪一項條件沒過、為何今天沒有標的" },
         marketGuard: {
           type: "object",
-          description: "大盤保護（預設啟用：加權指數 IX0001 或台積電 2330 任一跌幅 ≥ 1.5% 就暫停所有新的進場通知，回升 0.5 個百分點後恢復）。把劇本中「大盤／台積電跌逾 X% 就不做」寫在這裡",
+          description: "大盤保護（預設啟用：加權指數 IX0001 或台積電 2330 任一跌幅 ≥ 1.5% 就暫停新的做多進場通知，任一漲幅 ≥ 1.5% 就暫停新的做空進場通知，回到門檻內 0.5 個百分點後恢復）。把劇本中「大盤／台積電跌逾 X% 就不做」「漲逾 X% 就不空」寫在這裡",
           properties: {
             enabled: { type: "boolean" },
             symbols: { type: "array", maxItems: 3, items: { type: "string" }, description: "預設 [\"IX0001\",\"2330\"]；櫃買指數為 IX0043" },
             dropPercent: { type: "number", description: "跌幅門檻（%），0.3–5，預設 1.5" },
+            risePercent: { type: "number", description: "漲幅門檻（%），0.3–5，預設 1.5；只影響空方" },
           },
         },
         items: {
@@ -180,14 +181,16 @@ const TOOLS = [
             properties: {
               symbol: { type: "string" },
               name: { type: "string" },
+              side: { type: "string", enum: ["long", "short"], description: "long＝做多（預設）；short＝做空當沖，條件改用 invalidAbove／priceBelow／abandonAbove" },
               prevClose: { type: "number" },
-              invalidBelow: { type: "number" },
+              invalidBelow: { type: "number", description: "多方失效價" },
+              invalidAbove: { type: "number", description: "空方失效價：現價漲到此價以上就失效" },
               note: { type: "string", description: "無法自動判斷的文字條件，一句話" },
               reason: { type: "string", description: "入選理由：具體催化事件＋資料時間，一到兩句" },
               checks: { type: "array", maxItems: 8, items: { type: "string" }, description: "逐項條件檢核，每項含實際數值與 ✅／⚠️，例如「收盤 41.3 ✅」「成交金額第 18 名 ✅」「5 日均振幅 3.4% ✅」「當沖比 56% ⚠️ 超標」「注意股 ⚠️」" },
               tier: { type: "string", enum: ["main", "secondary"], description: "secondary＝有條件超標而降級的次級觀察" },
               peers: { type: "array", maxItems: 3, items: { type: "string" }, description: "同業代號（最多 3 檔），例如欣興填 [\"8046\",\"3189\"]。同業平均跌幅 ≥ peerDropPercent 時暫停這檔的進場通知。把劇本中「同業翻黑就刪除」寫在這裡" },
-              peerDropPercent: { type: "number", description: "同業平均跌幅門檻（%），0.3–8，預設 2" },
+              peerDropPercent: { type: "number", description: "同業平均跌幅門檻（%），0.3–8，預設 2；空方代表同業平均漲幅門檻" },
               entries: {
                 type: "array",
                 minItems: 1,
@@ -197,12 +200,14 @@ const TOOLS = [
                     id: { type: "string" },
                     label: { type: "string" },
                     when: { type: "string", enum: ["high", "flat", "low", "any"] },
-                    priceAbove: { type: "number" },
+                    priceAbove: { type: "number", description: "多方觸發價（現價 ≥ 此價）" },
+                    priceBelow: { type: "number", description: "空方觸發價（現價 ≤ 此價）" },
                     holdMinutes: { type: "integer", minimum: 1, maximum: 30 },
                     minVolumeRatio: { type: "number" },
-                    abandonBelow: { type: "number" },
+                    abandonBelow: { type: "number", description: "多方放棄價" },
+                    abandonAbove: { type: "number", description: "空方放棄價" },
                   },
-                  required: ["when", "priceAbove"],
+                  required: ["when"],
                 },
               },
             },
@@ -734,11 +739,30 @@ async function getAlertLists() {
   };
 }
 
+/** 回傳被暫停先賣後買的代號；證交所名單不含上櫃股票，上櫃股只能靠盤中報價判斷 */
+async function sellFirstSuspendedSymbols(symbols) {
+  const list = indexBy(await twse("/exchangeReport/TWTB4U"), "Code");
+  return symbols.filter((s) => String(list.get(s)?.Suspension ?? "").trim());
+}
+
 async function setDaytradeWatchlist(env, args) {
   if (!env.MONITOR) throw new Error("伺服器尚未設定 MONITOR（Durable Object）綁定");
   const wl = validateWatchlist(args);
   const today = taipeiParts().date;
   if (wl.date < today) throw new Error(`date ${wl.date} 已經過去（今天是 ${today}）`);
+  // 空方：先賣後買被暫停的上市股不可放入清單。證交所名單讀不到時先放行，盤中由報價再擋一次
+  const shortSymbols = wl.items.filter((it) => it.side === "short").map((it) => it.symbol);
+  let sellFirstCheck = null;
+  if (shortSymbols.length) {
+    let suspended = null;
+    try {
+      suspended = await sellFirstSuspendedSymbols(shortSymbols);
+      sellFirstCheck = "已核對證交所暫停先賣後買名單";
+    } catch (e) {
+      sellFirstCheck = `未能核對暫停先賣後買名單（${e.message}），開盤後仍會依即時報價判斷`;
+    }
+    if (suspended?.length) throw new Error(`暫停先賣後買，不可放入空方：${suspended.join("、")}`);
+  }
   const prev = await kvGet(env, "watchlist");
   await kvPut(env, "watchlist", wl);
   await kvPut(env, `state:${wl.date}`, null);
@@ -754,10 +778,11 @@ async function setDaytradeWatchlist(env, args) {
     ok: true,
     announced: announced == null ? "未推播（announce=false）" : announced.ok ? `已推播到 ${announced.sentTo} 個收件者` : `推播失敗：${announced.reason}`,
     date: wl.date,
-    items: wl.items.map((it) => `${it.symbol} ${it.name}：${it.entries.length} 個條件，失效價 ${it.invalidBelow ?? "未設"}`),
+    items: wl.items.map((it) => `${it.symbol} ${it.name}${it.side === "short" ? "（做空）" : ""}：${it.entries.length} 個條件，失效價 ${it.invalidBelow ?? it.invalidAbove ?? "未設"}`),
+    ...(sellFirstCheck ? { sellFirstCheck } : {}),
     noNewEntryAfter: wl.noNewEntryAfter,
     telegramConfigured: Boolean(env.TELEGRAM_BOT_TOKEN && env.TELEGRAM_CHAT_ID),
-    note: "監控時段為台北 09:01–13:25，每數秒檢查一次；進場通知後會追蹤停損（-1%）、第一目標（+0.6%）與保本；13:15 會對未出場的標的發平倉提醒。",
+    note: "監控時段為台北 09:01–13:25，每數秒檢查一次；進場通知後會追蹤停損（多方 -1%、空方 +1%）、第一目標（多方 +0.6%、空方 -0.6%）與保本；13:15 會對未出場的標的發平倉提醒。",
   };
 }
 
@@ -807,7 +832,7 @@ async function handleRpc(env, msg) {
         capabilities: { tools: { listChanged: false } },
         serverInfo: SERVER_INFO,
         instructions:
-          "台股行情。富果 API（上市上櫃皆可，每分鐘 60 次額度）：查價、漲跌停與可否現沖用 get_quotes；大盤背景用 get_market_overview；開盤後走勢與量能用 get_intraday_candles；近 N 日量價、振幅、均線用 get_daily_history。證交所 OpenAPI（前一交易日盤後資料，僅上市股票，不吃富果額度）：當沖前先用 get_daytrade_status 確認可否當沖、是否注意／處置；個股融資融券用 get_margin_trading；估值用 get_valuation；全部注意／處置股用 get_alert_lists。注意時段：開盤前或休市日，盤中工具回傳的是最近一個交易日資料，請看 isToday／date。盤中監控：set_daytrade_watchlist 寫入當日當沖條件後，伺服器每數秒自動檢查並以 Telegram 通知（含進場後的停損、第一目標與保本通知）；get_daytrade_watchlist 查看狀態。所有工具的個股成交量單位一律為「張」，成交金額為「元」；所有時間為台北時間。",
+          "台股行情。富果 API（上市上櫃皆可，每分鐘 60 次額度）：查價、漲跌停與可否現沖用 get_quotes；大盤背景用 get_market_overview；開盤後走勢與量能用 get_intraday_candles；近 N 日量價、振幅、均線用 get_daily_history。證交所 OpenAPI（前一交易日盤後資料，僅上市股票，不吃富果額度）：當沖前先用 get_daytrade_status 確認可否當沖、是否注意／處置；個股融資融券用 get_margin_trading；估值用 get_valuation；全部注意／處置股用 get_alert_lists。注意時段：開盤前或休市日，盤中工具回傳的是最近一個交易日資料，請看 isToday／date。盤中監控：set_daytrade_watchlist 寫入當日當沖條件（多方與空方皆可）後，伺服器每數秒自動檢查並以 Telegram 通知（含進場後的停損、第一目標與保本通知）；get_daytrade_watchlist 查看狀態。所有工具的個股成交量單位一律為「張」，成交金額為「元」；所有時間為台北時間。",
       });
     }
     case "ping":
