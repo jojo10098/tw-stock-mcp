@@ -1,7 +1,7 @@
 /**
  * 當沖盤中監控
  *
- * 流程：06:00 晨報用 MCP 工具 set_daytrade_watchlist 寫入當日清單（結構化條件）
+ * 流程：06:00 晨報用 MCP 工具 set_daytrade_watchlist 寫入當日清單（結構化條件，多方或空方）
  *      → Cloudflare Cron 每分鐘（台北 09:00–13:59）呼叫 runMonitorTick
  *      → 查即時報價、比對條件 → 成立時用 Telegram 通知
  *
@@ -69,14 +69,30 @@ function snap(x, tick, mode) {
   return Number((k * tick).toFixed(2));
 }
 
-/** 停損 -1%、第一目標 +0.6%，依升降單位取整（停損往上取、目標往上取，確保虧損不超過 1%、獲利至少 0.6%） */
-export function exitLevels(entry) {
+/**
+ * 停損 1%、第一目標 0.6%，依升降單位取整，確保虧損不超過 1%、獲利至少 0.6%。
+ * 多方：停損 -1%（往上取）、目標 +0.6%（往上取）；空方：停損 +1%（往下取）、目標 -0.6%（往下取）。
+ */
+export function exitLevels(entry, side = "long") {
+  if (side === "short") {
+    const stopRaw = entry * 1.01;
+    const targetRaw = entry * 0.994;
+    return {
+      stop: snap(stopRaw, tickSize(stopRaw), "down"),
+      target: snap(targetRaw, tickSize(targetRaw), "down"),
+    };
+  }
   const stopRaw = entry * 0.99;
   const targetRaw = entry * 1.006;
   return {
     stop: snap(stopRaw, tickSize(stopRaw), "up"),
     target: snap(targetRaw, tickSize(targetRaw), "up"),
   };
+}
+
+/** 每張的停損虧損（元） */
+export function lossPerLot(entry, stop, side = "long") {
+  return Math.round((side === "short" ? stop - entry : entry - stop) * 1000);
 }
 
 export function scenarioOf(openGapPercent) {
@@ -175,16 +191,27 @@ function pctIn(v, def, lo, hi, field) {
   return n;
 }
 
-/** 大盤保護：預設看加權指數與台積電，任一跌幅 ≥ 1.5% 就暫停新的進場通知；enabled:false 可關閉 */
-export const DEFAULT_MARKET_GUARD = { enabled: true, symbols: ["IX0001", "2330"], dropPercent: 1.5 };
+/**
+ * 大盤保護：預設看加權指數與台積電。
+ * 多方：任一跌幅 ≥ dropPercent（預設 1.5%）暫停做多進場；空方：任一漲幅 ≥ risePercent（預設 1.5%）暫停做空進場。
+ * enabled:false 可關閉。
+ */
+export const DEFAULT_MARKET_GUARD = { enabled: true, symbols: ["IX0001", "2330"], dropPercent: 1.5, risePercent: 1.5 };
 function validateMarketGuard(g) {
   if (g === false || g?.enabled === false) return { ...DEFAULT_MARKET_GUARD, enabled: false };
   const symbols = Array.isArray(g?.symbols) && g.symbols.length
     ? g.symbols.map((x) => String(x).trim().toUpperCase()).slice(0, 3)
     : DEFAULT_MARKET_GUARD.symbols;
   for (const x of symbols) if (!SYMBOL_RE.test(x)) throw new Error(`marketGuard.symbols 格式錯誤：${x}`);
-  return { enabled: true, symbols, dropPercent: pctIn(g?.dropPercent, DEFAULT_MARKET_GUARD.dropPercent, 0.3, 5, "marketGuard.dropPercent") };
+  return {
+    enabled: true,
+    symbols,
+    dropPercent: pctIn(g?.dropPercent, DEFAULT_MARKET_GUARD.dropPercent, 0.3, 5, "marketGuard.dropPercent"),
+    risePercent: pctIn(g?.risePercent, DEFAULT_MARKET_GUARD.risePercent, 0.3, 5, "marketGuard.risePercent"),
+  };
 }
+
+const sideOf = (it) => (it?.side === "short" ? "short" : "long");
 
 export function validateWatchlist(input) {
   const date = String(input?.date ?? "");
@@ -202,11 +229,18 @@ export function validateWatchlist(input) {
     const entries = Array.isArray(it?.entries) ? it.entries : [];
     if (entries.length === 0) throw new Error(`${symbol} 至少要有一個進場條件`);
     const ids = new Set();
+    if (it?.side != null && !["long", "short"].includes(it.side)) throw new Error(`${symbol}.side 只能是 long／short`);
+    const side = sideOf(it);
+    const short = side === "short";
+    if (short && it?.invalidBelow != null) throw new Error(`${symbol} 是空方：失效價請用 invalidAbove（漲破就失效），不要用 invalidBelow`);
+    if (!short && it?.invalidAbove != null) throw new Error(`${symbol} 是多方：失效價請用 invalidBelow，invalidAbove 只給空方（side:"short"）`);
     return {
       symbol,
       name: String(it?.name ?? ""),
+      side,
       prevClose: posNum(it?.prevClose, `${symbol}.prevClose`),
-      invalidBelow: posNum(it?.invalidBelow, `${symbol}.invalidBelow`),
+      invalidBelow: short ? null : posNum(it?.invalidBelow, `${symbol}.invalidBelow`),
+      invalidAbove: short ? posNum(it?.invalidAbove, `${symbol}.invalidAbove`) : null,
       note: it?.note ? String(it.note).slice(0, 200) : undefined,
       reason: it?.reason ? String(it.reason).slice(0, 200) : undefined,
       checks: strList(it?.checks, 8, 60),
@@ -223,16 +257,32 @@ export function validateWatchlist(input) {
         ids.add(id);
         const when = e?.when ?? "any";
         if (!["high", "flat", "low", "any"].includes(when)) throw new Error(`${symbol}.${id}.when 只能是 high／flat／low／any`);
+        const holdMinutes = e?.holdMinutes == null ? 1 : Math.max(1, Math.min(30, parseInt(e.holdMinutes, 10) || 1));
+        const minVolumeRatio = e?.minVolumeRatio == null ? null : posNum(e.minVolumeRatio, `${symbol}.${id}.minVolumeRatio`);
+        if (short) {
+          if (e?.priceAbove != null || e?.abandonBelow != null) throw new Error(`${symbol}.${id} 是空方：請用 priceBelow（跌破觸發）與 abandonAbove（漲破放棄）`);
+          const priceBelow = posNum(e?.priceBelow, `${symbol}.${id}.priceBelow`);
+          if (priceBelow == null) throw new Error(`${symbol}.${id} 缺少 priceBelow（空方觸發價）`);
+          return {
+            id,
+            label: String(e?.label ?? `${SCENARIO_LABEL[when]}跌破 ${priceBelow}`).slice(0, 60),
+            when,
+            priceBelow,
+            holdMinutes,
+            minVolumeRatio,
+            abandonAbove: posNum(e?.abandonAbove, `${symbol}.${id}.abandonAbove`),
+          };
+        }
+        if (e?.priceBelow != null || e?.abandonAbove != null) throw new Error(`${symbol}.${id} 是多方：priceBelow／abandonAbove 只給空方（side:"short"）`);
         const priceAbove = posNum(e?.priceAbove, `${symbol}.${id}.priceAbove`);
         if (priceAbove == null) throw new Error(`${symbol}.${id} 缺少 priceAbove（觸發價）`);
-        const holdMinutes = e?.holdMinutes == null ? 1 : Math.max(1, Math.min(30, parseInt(e.holdMinutes, 10) || 1));
         return {
           id,
           label: String(e?.label ?? `${SCENARIO_LABEL[when]}站上 ${priceAbove}`).slice(0, 60),
           when,
           priceAbove,
           holdMinutes,
-          minVolumeRatio: e?.minVolumeRatio == null ? null : posNum(e.minVolumeRatio, `${symbol}.${id}.minVolumeRatio`),
+          minVolumeRatio,
           abandonBelow: posNum(e?.abandonBelow, `${symbol}.${id}.abandonBelow`),
         };
       }),
@@ -271,41 +321,56 @@ export function evaluateItem(item, quote, st, ctx) {
   if (price == null) return events;
   st.positions ??= {};
   const nowSec = ctx.sec ?? ctx.minute * 60;
+  const short = sideOf(item) === "short";
+  // 不利方向（多方＝下跌、空方＝上漲）是否已到某價
+  const hitStop = (p, lvl) => (short ? p >= lvl : p <= lvl);
+  const hitTarget = (p, lvl) => (short ? p <= lvl : p >= lvl);
 
   // 已發出進場通知的部位：追蹤停損、第一目標、保本（即使該檔之後失效也繼續追蹤）
   for (const [id, pos] of Object.entries(st.positions)) {
-    if (pos.status === "open" && price <= pos.stop) {
+    if (pos.status === "open" && hitStop(price, pos.stop)) {
       pos.status = "closed";
       pos.exit = { type: "stop", at: ctx.hhmm, price };
       events.push({ type: "stop", pos, price });
-    } else if (pos.status === "open" && price >= pos.target) {
+    } else if (pos.status === "open" && hitTarget(price, pos.target)) {
       pos.status = "target";
       pos.targetAt = { at: ctx.hhmm, price };
       events.push({ type: "target", pos, price });
-    } else if (pos.status === "target" && price <= pos.entryPrice) {
+    } else if (pos.status === "target" && hitStop(price, pos.entryPrice)) {
       pos.status = "closed";
       pos.exit = { type: "breakeven", at: ctx.hhmm, price };
       events.push({ type: "breakeven", pos, price });
+    }
+    // 空單逼近漲停：鎖漲停就買不回，提醒立刻回補（每筆部位只提醒一次）
+    if (short && pos.status !== "closed" && !pos.limitWarned && quote.toLimitUpPercent != null && quote.toLimitUpPercent <= 2) {
+      pos.limitWarned = true;
+      events.push({ type: "nearLimitUp", pos, price, toLimitUpPercent: quote.toLimitUpPercent, limitUpPrice: quote.limitUpPrice });
     }
   }
   if (st.invalidated) return events;
   const tracking = Object.values(st.positions).some((p) => p.status !== "closed");
 
-  // 交易限制變化：處置、分盤撮合、不可當沖 → 直接失效
+  // 交易限制變化：處置、分盤撮合、不可當沖（空方另含暫停先賣後買）→ 直接失效
   const blocked =
     quote.isDisposition === true ? "被列為處置股"
       : quote.matchingIntervalSeconds > 0 ? `改為分盤撮合（${quote.matchingIntervalSeconds} 秒）`
         : quote.canDayTrade === false ? "今日不可現股當沖"
-          : null;
+          : short && quote.canBuyFirstDayTradeOnly === true ? "今日暫停先賣後買（只能先買後賣），不能做空當沖"
+            : null;
   if (blocked) {
     st.invalidated = true;
     events.push({ type: "invalid", reason: blocked, price, tracking });
     return events;
   }
 
-  if (item.invalidBelow != null && price <= item.invalidBelow) {
+  if (!short && item.invalidBelow != null && price <= item.invalidBelow) {
     st.invalidated = true;
     events.push({ type: "invalid", reason: `跌破失效價 ${item.invalidBelow}`, price, tracking });
+    return events;
+  }
+  if (short && item.invalidAbove != null && price >= item.invalidAbove) {
+    st.invalidated = true;
+    events.push({ type: "invalid", reason: `漲破失效價 ${item.invalidAbove}`, price, tracking });
     return events;
   }
 
@@ -322,7 +387,7 @@ export function evaluateItem(item, quote, st, ctx) {
     if (e.when !== "any" && e.when !== scenario) continue;
     if (st.fired[e.id] || st.abandoned[e.id]) continue;
 
-    if (e.abandonBelow != null && price <= e.abandonBelow) {
+    if (short ? e.abandonAbove != null && price >= e.abandonAbove : e.abandonBelow != null && price <= e.abandonBelow) {
       st.abandoned[e.id] = true;
       delete st.holdSince[e.id];
       events.push({ type: "abandon", entry: e, price, scenario });
@@ -335,7 +400,7 @@ export function evaluateItem(item, quote, st, ctx) {
       continue;
     }
 
-    let ok = price >= e.priceAbove;
+    let ok = short ? price <= e.priceBelow : price >= e.priceAbove;
     if (ok && e.minVolumeRatio != null) ok = volRatio != null && volRatio >= e.minVolumeRatio;
     if (!ok) {
       delete st.holdSince[e.id];
@@ -344,9 +409,9 @@ export function evaluateItem(item, quote, st, ctx) {
     // 「連續成立 N 分鐘」：從第一次成立起算，持續 (N−1)×60 秒仍成立就觸發（N=1 為立即觸發）
     if (st.holdSince[e.id] == null) st.holdSince[e.id] = nowSec;
     if (nowSec - st.holdSince[e.id] >= (e.holdMinutes - 1) * 60) {
-      const levels = exitLevels(price);
+      const levels = exitLevels(price, short ? "short" : "long");
       st.fired[e.id] = { at: ctx.hhmm, price };
-      st.positions[e.id] = { id: e.id, label: e.label, entryPrice: price, stop: levels.stop, target: levels.target, at: ctx.hhmm, status: "open" };
+      st.positions[e.id] = { id: e.id, label: e.label, side: short ? "short" : "long", entryPrice: price, stop: levels.stop, target: levels.target, at: ctx.hhmm, status: "open" };
       events.push({ type: "entry", entry: e, price, scenario, volRatio, volMethod, volDays, levels });
     }
   }
@@ -374,21 +439,29 @@ export function guardSymbols(wl) {
  * @param paused  目前是否暫停中
  * @returns { paused, changed, detail }
  */
-export function evalMarketGuard(guard, quotes, paused) {
+export function evalMarketGuard(guard, quotes, paused, side = "long") {
   if (!guard || guard.enabled === false) return { paused: false, changed: paused === true, detail: [] };
   const detail = guard.symbols
     .map((sym) => ({ sym, q: quotes[sym] }))
     .filter((x) => x.q && !x.q.error && x.q.isToday !== false && x.q.changePercent != null)
     .map((x) => ({ symbol: x.sym, name: x.q.name ?? x.sym, changePercent: x.q.changePercent }));
   if (!detail.length) return { paused, changed: false, detail };
-  const worst = Math.min(...detail.map((d) => d.changePercent));
   let next = paused;
+  if (side === "short") {
+    // 空方：大盤或台積電急漲時暫停做空，漲幅回落 0.5 個百分點才恢復
+    const rise = guard.risePercent ?? DEFAULT_MARKET_GUARD.risePercent;
+    const best = Math.max(...detail.map((d) => d.changePercent));
+    if (!paused && best >= rise) next = true;
+    else if (paused && best < rise - RESUME_MARGIN) next = false;
+    return { paused: next, changed: next !== paused, detail, best };
+  }
+  const worst = Math.min(...detail.map((d) => d.changePercent));
   if (!paused && worst <= -guard.dropPercent) next = true;
   else if (paused && worst > -(guard.dropPercent - RESUME_MARGIN)) next = false;
   return { paused: next, changed: next !== paused, detail, worst };
 }
 
-/** 同業保護判斷：同業平均漲跌幅 ≤ −peerDropPercent 時暫停該檔 */
+/** 同業保護判斷：多方＝同業平均漲跌幅 ≤ −門檻時暫停；空方＝同業平均漲幅 ≥ 門檻時暫停 */
 export function evalPeerGuard(item, quotes, paused) {
   if (!item.peers?.length) return { paused: false, changed: false, detail: [] };
   const detail = item.peers
@@ -397,24 +470,40 @@ export function evalPeerGuard(item, quotes, paused) {
     .map((x) => ({ symbol: x.sym, name: x.q.name ?? x.sym, changePercent: x.q.changePercent }));
   if (!detail.length) return { paused, changed: false, detail };
   const avg = detail.reduce((a, d) => a + d.changePercent, 0) / detail.length;
+  const th = item.peerDropPercent;
   let next = paused;
-  if (!paused && avg <= -item.peerDropPercent) next = true;
-  else if (paused && avg > -(item.peerDropPercent - RESUME_MARGIN)) next = false;
+  if (sideOf(item) === "short") {
+    if (!paused && avg >= th) next = true;
+    else if (paused && avg < th - RESUME_MARGIN) next = false;
+  } else {
+    if (!paused && avg <= -th) next = true;
+    else if (paused && avg > -(th - RESUME_MARGIN)) next = false;
+  }
   return { paused: next, changed: next !== paused, detail, avg: Math.round(avg * 100) / 100 };
 }
 
 const pctTxt = (n) => `${n > 0 ? "+" : ""}${Number(n).toFixed(2)}%`;
 
-export function formatMarketGuard(g, r, hhmm) {
+export function formatMarketGuard(g, r, hhmm, side = "long") {
   const list = r.detail.map((d) => `${d.name} ${pctTxt(d.changePercent)}`).join("、");
+  if (side === "short") {
+    return r.paused
+      ? `⚠️ 大盤急漲，暫停做空進場（${hhmm}）\n${list}（門檻 +${g.risePercent ?? DEFAULT_MARKET_GUARD.risePercent}%）\n暫停所有新的放空通知；已進場的空單仍會追蹤停損與目標。`
+      : `✅ 大盤漲勢收斂，恢復做空監控（${hhmm}）\n${list}`;
+  }
   return r.paused
-    ? `⚠️ 大盤轉弱，暫停進場（${hhmm}）\n${list}（門檻 -${g.dropPercent}%）\n暫停所有新的進場通知；已進場的部位仍會追蹤停損與目標。`
+    ? `⚠️ 大盤轉弱，暫停進場（${hhmm}）\n${list}（門檻 -${g.dropPercent}%）\n暫停所有新的做多進場通知；已進場的部位仍會追蹤停損與目標。`
     : `✅ 大盤回穩，恢復進場監控（${hhmm}）\n${list}`;
 }
 
 export function formatPeerGuard(item, r, hhmm) {
   const title = `${item.symbol} ${item.name ?? ""}`.trim();
   const list = r.detail.map((d) => `${d.name} ${pctTxt(d.changePercent)}`).join("、");
+  if (sideOf(item) === "short") {
+    return r.paused
+      ? `⏸ 同業轉強｜🔻${title}（${hhmm}）\n${list}，平均 ${pctTxt(r.avg)}（門檻 +${item.peerDropPercent}%）\n這檔暫停放空通知；已進場的空單仍會追蹤停損與目標。`
+      : `▶️ 同業轉弱｜🔻${title}（${hhmm}）\n${list}，平均 ${pctTxt(r.avg)}，恢復這檔的放空監控。`;
+  }
   return r.paused
     ? `⏸ 同業轉弱｜${title}（${hhmm}）\n${list}，平均 ${pctTxt(r.avg)}（門檻 -${item.peerDropPercent}%）\n這檔暫停進場通知；已進場的部位仍會追蹤停損與目標。`
     : `▶️ 同業回穩｜${title}（${hhmm}）\n${list}，平均 ${pctTxt(r.avg)}，恢復這檔的進場監控。`;
@@ -427,16 +516,18 @@ export function formatPeerGuard(item, r, hhmm) {
 const fmt = (n) => (n == null ? "—" : Number(n).toLocaleString("en-US", { maximumFractionDigits: 2 }));
 
 export function formatEvent(item, quote, ev, hhmm) {
-  const title = `${item.symbol} ${item.name || quote?.name || ""}`.trim();
+  const short = sideOf(item) === "short";
+  const title = `${short ? "🔻" : ""}${item.symbol} ${item.name || quote?.name || ""}`.trim();
   const chg = quote?.changePercent != null ? `${quote.changePercent > 0 ? "+" : ""}${quote.changePercent}%` : "—";
+  const how = ev.volMethod === "profile" ? `近 ${ev.volDays} 日同時段實際累計量` : "近 5 日均量線性估算";
+  const vol =
+    ev.volRatio != null
+      ? `量能：累計 ${fmt(quote?.tradeVolume)} 張，為${how}的 ${ev.volRatio.toFixed(1)} 倍`
+      : `量能：累計 ${fmt(quote?.tradeVolume)} 張`;
+  if (short) return formatShortEvent(title, chg, vol, ev, hhmm);
   if (ev.type === "entry") {
     const lot = Math.round(ev.price * 1000);
     const loss = Math.round((ev.price - ev.levels.stop) * 1000);
-    const how = ev.volMethod === "profile" ? `近 ${ev.volDays} 日同時段實際累計量` : "近 5 日均量線性估算";
-    const vol =
-      ev.volRatio != null
-        ? `量能：累計 ${fmt(quote.tradeVolume)} 張，為${how}的 ${ev.volRatio.toFixed(1)} 倍`
-        : `量能：累計 ${fmt(quote?.tradeVolume)} 張`;
     return [
       `🟢 當沖條件成立｜${title}`,
       `劇本：${SCENARIO_LABEL[ev.scenario]}｜${ev.entry.label}`,
@@ -479,6 +570,56 @@ export function formatEvent(item, quote, ev, hhmm) {
   return "";
 }
 
+/** 空方（先賣後買）的通知文字 */
+function formatShortEvent(title, chg, vol, ev, hhmm) {
+  if (ev.type === "entry") {
+    const lot = Math.round(ev.price * 1000);
+    const loss = lossPerLot(ev.price, ev.levels.stop, "short");
+    return [
+      `🔻 放空條件成立｜${title}`,
+      `劇本：${SCENARIO_LABEL[ev.scenario]}｜${ev.entry.label}`,
+      `現價 ${fmt(ev.price)}（${hhmm}）｜今日 ${chg}`,
+      vol,
+      `若進場（先賣）：停損 ${fmt(ev.levels.stop)}（+1%）｜第一目標 ${fmt(ev.levels.target)}（-0.6%）`,
+      `1 張約 ${fmt(lot)} 元，觸發停損約虧 ${fmt(loss)} 元＋來回成本`,
+      `13:20 前一律回補；急拉逼近漲停立刻回補。這是條件通知，不是下單指令；請先看分時與五檔。`,
+    ].join("\n");
+  }
+  if (ev.type === "invalid") {
+    const more = ev.tracking ? "\n已發出的放空部位仍會繼續追蹤停損與目標。" : "";
+    return `🔴 失效｜${title}\n${ev.reason}（現價 ${fmt(ev.price)}，${hhmm}），今日不再發新的放空通知。${more}`;
+  }
+  if (ev.type === "stop") {
+    const p = ev.pos;
+    const loss = lossPerLot(p.entryPrice, ev.price, "short");
+    return [
+      `🛑 漲破停損｜${title}`,
+      `${p.at} 放空通知價 ${fmt(p.entryPrice)}（${p.label}）`,
+      `現價 ${fmt(ev.price)}（${hhmm}）已漲破停損 ${fmt(p.stop)}`,
+      `若有空單請回補：每張約虧 ${fmt(loss)} 元＋來回成本。今天這檔不再追。`,
+    ].join("\n");
+  }
+  if (ev.type === "target") {
+    const p = ev.pos;
+    return [
+      `🎯 達第一目標｜${title}`,
+      `${p.at} 放空通知價 ${fmt(p.entryPrice)}，現價 ${fmt(ev.price)}（${hhmm}）已達目標 ${fmt(p.target)}（-0.6%）`,
+      `若有空單：先回補一半；剩餘停損下移到放空價 ${fmt(p.entryPrice)}（保本），漲回會再通知。`,
+    ].join("\n");
+  }
+  if (ev.type === "breakeven") {
+    const p = ev.pos;
+    return `⚪ 回到放空價｜${title}\n現價 ${fmt(ev.price)}（${hhmm}）反彈至放空價 ${fmt(p.entryPrice)}，剩餘空單保本回補。`;
+  }
+  if (ev.type === "nearLimitUp") {
+    return `🚨 逼近漲停｜${title}\n現價 ${fmt(ev.price)}（${hhmm}），距漲停 ${fmt(ev.limitUpPrice)} 只剩 ${Number(ev.toLimitUpPercent).toFixed(2)}%。\n空單請立刻回補：鎖漲停就買不回，須借券或標借補足。`;
+  }
+  if (ev.type === "abandon") {
+    return `⚪ 劇本放棄｜${title}\n${SCENARIO_LABEL[ev.scenario]}劇本「${ev.entry.label}」漲破 ${fmt(ev.entry.abandonAbove)}（現價 ${fmt(ev.price)}，${hhmm}）。`;
+  }
+  return "";
+}
+
 /** 晨報寫入清單後的「今日標的」公告 */
 export function formatWatchlistAnnouncement(wl, { isUpdate = false, test = false } = {}) {
   const d = new Date(`${wl.date}T00:00:00Z`);
@@ -492,31 +633,51 @@ export function formatWatchlistAnnouncement(wl, { isUpdate = false, test = false
     return [head, `今日沒有符合條件的當沖標的，不啟動盤中監控。${wl.noPickReason ? `\n原因：${wl.noPickReason}` : ""}`, ...crit].join("\n");
   }
   const lines = [head, test ? `共 ${wl.items.length} 檔（測試，不會啟動盤中監控）。` : `共 ${wl.items.length} 檔，09:01 起自動監控，條件成立會另行通知。`, ...crit];
-  wl.items.forEach((it, i) => {
+  const longs = wl.items.filter((it) => sideOf(it) === "long");
+  const shorts = wl.items.filter((it) => sideOf(it) === "short");
+  const renderItem = (it, i) => {
+    const short = sideOf(it) === "short";
     const tag = it.tier === "secondary" ? "【⚠️ 次級觀察，部位減半】" : "";
-    lines.push("", `${i + 1}) ${it.symbol} ${it.name}`.trim() + `${tag}｜昨收 ${fmt(it.prevClose)}｜失效價 ${fmt(it.invalidBelow)}`);
+    const inv = short ? `漲破 ${fmt(it.invalidAbove)} 失效` : `失效價 ${fmt(it.invalidBelow)}`;
+    lines.push("", `${i + 1}) ${short ? "🔻" : ""}${it.symbol} ${it.name}`.trim() + `${tag}｜昨收 ${fmt(it.prevClose)}｜${inv}`);
     if (it.reason) lines.push(`  入選理由：${it.reason}`);
     if (it.checks?.length) lines.push(`  條件檢核：${it.checks.join("｜")}`);
     for (const e of it.entries) {
-      const cond = [`≥ ${fmt(e.priceAbove)}`, e.holdMinutes > 1 ? `連續 ${e.holdMinutes} 分鐘` : null, e.minVolumeRatio ? `量比 ≥ ${e.minVolumeRatio}` : null]
+      const trig = short ? `≤ ${fmt(e.priceBelow)}` : `≥ ${fmt(e.priceAbove)}`;
+      const cond = [trig, e.holdMinutes > 1 ? `連續 ${e.holdMinutes} 分鐘` : null, e.minVolumeRatio ? `量比 ≥ ${e.minVolumeRatio}` : null]
         .filter(Boolean).join("、");
-      const ab = e.abandonBelow != null ? `；跌破 ${fmt(e.abandonBelow)} 放棄` : "";
+      const ab = short
+        ? (e.abandonAbove != null ? `；漲破 ${fmt(e.abandonAbove)} 放棄` : "")
+        : (e.abandonBelow != null ? `；跌破 ${fmt(e.abandonBelow)} 放棄` : "");
       lines.push(`  • ${SCENARIO_LABEL[e.when]}｜${e.label}（${cond}${ab}）`);
     }
-    const p = it.entries[0]?.priceAbove;
+    const p = short ? it.entries[0]?.priceBelow : it.entries[0]?.priceAbove;
     if (p) {
-      const lv = exitLevels(p);
-      lines.push(`  1 張約 ${fmt(Math.round(p * 1000))} 元；依觸發價停損 ${fmt(lv.stop)}，約虧 ${fmt(Math.round((p - lv.stop) * 1000))} 元`);
+      const lv = exitLevels(p, short ? "short" : "long");
+      lines.push(`  1 張約 ${fmt(Math.round(p * 1000))} 元；依觸發價停損 ${fmt(lv.stop)}，約虧 ${fmt(lossPerLot(p, lv.stop, short ? "short" : "long"))} 元`);
     }
-    if (it.peers?.length) lines.push(`  同業保護：${it.peers.join("、")} 平均跌逾 ${it.peerDropPercent}% 時暫停進場`);
+    if (it.peers?.length) {
+      lines.push(short
+        ? `  同業保護：${it.peers.join("、")} 平均漲逾 ${it.peerDropPercent}% 時暫停放空`
+        : `  同業保護：${it.peers.join("、")} 平均跌逾 ${it.peerDropPercent}% 時暫停進場`);
+    }
     if (it.note) lines.push(`  備註：${it.note}`);
-  });
+  };
+  if (longs.length && shorts.length) lines.push("", "🟢 多方");
+  longs.forEach(renderItem);
+  if (shorts.length) lines.push("", "🔻 空方（先賣後買）");
+  shorts.forEach(renderItem);
   const mgd = wl.marketGuard ?? DEFAULT_MARKET_GUARD;
   if (mgd.enabled !== false) {
     const names = mgd.symbols.map((x) => (x === "IX0001" ? "加權指數" : x === "IX0043" ? "櫃買指數" : x === "2330" ? "台積電" : x)).join("或");
-    lines.push("", `🛡 大盤保護：${names}跌逾 ${mgd.dropPercent}% 時暫停所有進場通知`);
+    const parts = [];
+    if (longs.length) parts.push(`跌逾 ${mgd.dropPercent}% 時暫停做多進場`);
+    if (shorts.length) parts.push(`漲逾 ${mgd.risePercent ?? DEFAULT_MARKET_GUARD.risePercent}% 時暫停做空進場`);
+    lines.push("", `🛡 大盤保護：${names}${parts.join("；")}`);
   }
-  lines.push("", `${wl.noNewEntryAfter} 後不發新進場通知；有部位 13:20 前平倉。`, "⚠️ 這是條件監控清單，不是買賣建議。");
+  lines.push("", `${wl.noNewEntryAfter} 後不發新進場通知；有部位 13:20 前平倉${shorts.length ? "（空單回補）" : ""}。`);
+  if (shorts.length) lines.push("🔻 做空當沖若當天買不回（例如鎖漲停）須借券或標借補足，空方部位應比多方更小。");
+  lines.push("⚠️ 這是條件監控清單，不是買賣建議。");
   const text = lines.join("\n");
   return text.length > 4000 ? text.slice(0, 3990) + "\n…（過長截斷）" : text; // Telegram 單則上限 4096 字
 }
@@ -724,10 +885,19 @@ export async function runMonitorTick(env, now, deps) {
   const gq = state.guard.quotes;
   const noNewEntryMin = hhmmToMinute(wl.noNewEntryAfter) ?? 12 * 60 + 30;
   const canStillEnter = t.minute <= noNewEntryMin;
-  const mg = evalMarketGuard(wl.marketGuard ?? DEFAULT_MARKET_GUARD, gq, state.guard.marketPaused);
+  const guardCfg = wl.marketGuard ?? DEFAULT_MARKET_GUARD;
+  const hasLong = wl.items.some((it) => sideOf(it) === "long");
+  const hasShort = wl.items.some((it) => sideOf(it) === "short");
+  const mg = evalMarketGuard(guardCfg, gq, state.guard.marketPaused);
   if (mg.changed) {
     state.guard.marketPaused = mg.paused;
-    if (canStillEnter) messages.push(formatMarketGuard(wl.marketGuard ?? DEFAULT_MARKET_GUARD, mg, t.hhmmss));
+    if (canStillEnter && hasLong) messages.push(formatMarketGuard(guardCfg, mg, t.hhmmss));
+  }
+  state.guard.marketPausedShort ??= false;
+  const mgs = evalMarketGuard(guardCfg, gq, state.guard.marketPausedShort, "short");
+  if (mgs.changed) {
+    state.guard.marketPausedShort = mgs.paused;
+    if (canStillEnter && hasShort) messages.push(formatMarketGuard(guardCfg, mgs, t.hhmmss, "short"));
   }
 
   if (active.length) {
@@ -741,7 +911,8 @@ export async function runMonitorTick(env, now, deps) {
         st.peerPaused = pg.paused;
         if (canStillEnter && !st.invalidated) messages.push(formatPeerGuard(it, pg, t.hhmmss));
       }
-      const blockEntries = state.guard.marketPaused || st.peerPaused === true;
+      const marketBlocked = sideOf(it) === "short" ? state.guard.marketPausedShort : state.guard.marketPaused;
+      const blockEntries = marketBlocked || st.peerPaused === true;
       const events = evaluateItem(it, quote, st, { minute: t.minute, sec: t.sec, hhmm: t.hhmmss, noNewEntryMin, volBase: state.volBase[it.symbol], blockEntries });
       for (const ev of events) {
         st.log.push({ at: t.hhmmss, type: ev.type, id: ev.entry?.id ?? ev.pos?.id ?? null, price: ev.price });
@@ -756,7 +927,7 @@ export async function runMonitorTick(env, now, deps) {
   if (!state.reminded && t.minute >= CLOSE_REMINDER_MIN && firedList.length) {
     state.reminded = true;
     const names = [...new Set(firedList)].map((s) => `${s} ${wl.items.find((i) => i.symbol === s)?.name ?? ""}`.trim());
-    messages.push(`⏰ 13:15 平倉提醒\n尚未出場的進場通知：${names.join("、")}\n若有部位，13:20 前一律平倉，不留倉、不轉現股。`);
+    messages.push(`⏰ 13:15 平倉提醒\n尚未出場的進場通知：${names.join("、")}\n若有部位，13:20 前一律平倉（空單回補），不留倉、不轉現股。`);
   }
 
   for (const text of messages) {
@@ -784,6 +955,7 @@ export async function watchStatus(env, now = new Date(Date.now())) {
     marketGuard: wl ? {
       ...(wl.marketGuard ?? DEFAULT_MARKET_GUARD),
       paused: state?.guard?.marketPaused ?? false,
+      pausedShort: state?.guard?.marketPausedShort ?? false,
       refreshSeconds: guardRefreshSeconds(guardSymbols(wl).length),
       lastQuotes: state?.guard?.quotes ?? {},
     } : null,
@@ -796,7 +968,9 @@ export async function watchStatus(env, now = new Date(Date.now())) {
       return {
         symbol: it.symbol,
         name: it.name,
+        side: sideOf(it),
         invalidBelow: it.invalidBelow,
+        invalidAbove: it.invalidAbove ?? null,
         volumeBaseline:
           vb === undefined ? "尚未建立（開盤後第一次檢查時建立）"
             : vb === null ? "無法取得歷史量，量能條件不會成立"
@@ -808,9 +982,11 @@ export async function watchStatus(env, now = new Date(Date.now())) {
           label: e.label,
           when: e.when,
           priceAbove: e.priceAbove,
+          priceBelow: e.priceBelow,
           holdMinutes: e.holdMinutes,
           minVolumeRatio: e.minVolumeRatio,
           abandonBelow: e.abandonBelow,
+          abandonAbove: e.abandonAbove,
           status: st?.fired?.[e.id] ? `已觸發 ${st.fired[e.id].at} @ ${st.fired[e.id].price}` : st?.abandoned?.[e.id] ? "已放棄" : "監控中",
         })),
         invalidated: st?.invalidated ?? false,
@@ -818,7 +994,7 @@ export async function watchStatus(env, now = new Date(Date.now())) {
         peerDropPercent: it.peerDropPercent,
         peerPaused: st?.peerPaused ?? false,
         positions: Object.values(st?.positions ?? {}).map((p) => ({
-          id: p.id, label: p.label, entryAt: p.at, entryPrice: p.entryPrice, stop: p.stop, target: p.target,
+          id: p.id, label: p.label, side: p.side ?? "long", entryAt: p.at, entryPrice: p.entryPrice, stop: p.stop, target: p.target,
           status: p.status === "open" ? "持有中（追蹤停損／目標）" : p.status === "target" ? "已達第一目標，剩餘保本追蹤" : `已結束（${p.exit?.type === "stop" ? "停損" : "保本"} ${p.exit?.at} @ ${p.exit?.price}）`,
         })),
         log: st?.log ?? [],

@@ -399,4 +399,157 @@ Date.now = realNow;
   Date.now = rn;
 }
 
+// ---------- 空方（先賣後買） ----------
+{
+  const { evalMarketGuard, evalPeerGuard, formatWatchlistAnnouncement: fa, setMonitorDeps } = await import("../src/monitor.js");
+  const ls = exitLevels(98.4, "short");
+  check("空方出場價 98.4 → 停損 99.3（+1% 往下取）／目標 97.8", ls.stop === 99.3 && ls.target === 97.8);
+  check("空方停損虧損不超過 1%、目標獲利至少 0.6%", (ls.stop - 98.4) / 98.4 <= 0.01 && (98.4 - ls.target) / 98.4 >= 0.006);
+  check("空方用 priceAbove → 錯誤", throws(() => validateWatchlist({ date: "2026-10-21", items: [{ symbol: "2303", side: "short", entries: [{ when: "flat", priceAbove: 97 }] }] })));
+  check("空方用 invalidBelow → 錯誤", throws(() => validateWatchlist({ date: "2026-10-21", items: [{ symbol: "2303", side: "short", invalidBelow: 90, entries: [{ when: "flat", priceBelow: 97 }] }] })));
+  check("多方用 priceBelow → 錯誤", throws(() => validateWatchlist({ date: "2026-10-21", items: [{ symbol: "2303", entries: [{ when: "flat", priceAbove: 97, priceBelow: 96 }] }] })));
+  check("side 不合法 → 錯誤", throws(() => validateWatchlist({ date: "2026-10-21", items: [{ symbol: "2303", side: "sell", entries: [{ when: "flat", priceBelow: 97 }] }] })));
+  const wls = validateWatchlist({ date: "2026-10-21", marketGuard: { risePercent: 1.2 }, items: [
+    { symbol: "6770", name: "力積電", prevClose: 52.9, invalidBelow: 51.5, entries: [{ id: "flat", when: "flat", priceAbove: 54.3, holdMinutes: 2 }] },
+    { symbol: "2303", name: "聯電", side: "short", prevClose: 98.4, invalidAbove: 100, peers: ["6770"], peerDropPercent: 1,
+      reason: "外資賣超 29,248 張（11/5）", checks: ["券資比 0.55% ✅", "未暫停先賣後買 ✅"],
+      entries: [{ id: "low", when: "low", label: "開低跌破 93", priceBelow: 93, holdMinutes: 3, abandonAbove: 96 }, { id: "flat", when: "flat", label: "開平跌破 97.4", priceBelow: 97.4, holdMinutes: 2 }] },
+  ] });
+  const sh = wls.items[1];
+  check("空方驗證：side、invalidAbove、priceBelow、risePercent", sh.side === "short" && sh.invalidAbove === 100 && sh.invalidBelow === null && sh.entries[0].priceBelow === 93 && sh.entries[0].abandonAbove === 96 && wls.marketGuard.risePercent === 1.2 && wls.items[0].side === "long");
+
+  const q = (p, extra = {}) => ({ lastPrice: p, tradeVolume: 1, openGapPercent: 0, isToday: true, canDayTrade: true, matchingIntervalSeconds: 0, ...extra });
+  const c = (sec) => ({ minute: Math.floor(sec / 60), sec, hhmm: "x", noNewEntryMin: 750 });
+  const T = 600 * 60;
+  const st = newSymbolState();
+  check("空方開平：價格在觸發價之上 → 不成立", evaluateItem(sh, q(97.6), st, c(T)).length === 0);
+  evaluateItem(sh, q(97.3), st, c(T + 6));
+  let ev = evaluateItem(sh, q(97.2), st, c(T + 66));
+  check("空方開平：跌破 97.4 連續 2 分鐘 → 放空通知", ev.length === 1 && ev[0].type === "entry" && st.positions.flat.side === "short" && st.positions.flat.stop === 98.1 && st.positions.flat.target === 96.6);
+  const txt = formatEvent(sh, { tradeVolume: 1, changePercent: -1.2 }, ev[0], "10:01:06");
+  check("放空通知文字", txt.startsWith("🔻 放空條件成立｜🔻2303 聯電") && txt.includes("停損 98.1（+1%）") && txt.includes("第一目標 96.6（-0.6%）") && txt.includes("回補"));
+  ev = evaluateItem(sh, q(96.6), st, c(T + 72));
+  check("空方跌到目標 → 🎯 先回補一半", ev.length === 1 && ev[0].type === "target" && formatEvent(sh, {}, ev[0], "x").includes("先回補一半"));
+  ev = evaluateItem(sh, q(97.2), st, c(T + 78));
+  check("空方達標後反彈到放空價 → 保本回補", ev.length === 1 && ev[0].type === "breakeven");
+
+  const st2 = newSymbolState();
+  evaluateItem(sh, q(97.3), st2, c(T)); evaluateItem(sh, q(97.3), st2, c(T + 60));
+  ev = evaluateItem(sh, q(98.2), st2, c(T + 66));
+  check("空方漲破停損 → 🛑 漲破停損", ev.length === 1 && ev[0].type === "stop" && formatEvent(sh, {}, ev[0], "x").startsWith("🛑 漲破停損"));
+  const st3 = newSymbolState();
+  evaluateItem(sh, q(97.3), st3, c(T)); evaluateItem(sh, q(97.3), st3, c(T + 60));
+  ev = evaluateItem(sh, q(97.5, { toLimitUpPercent: 1.8, limitUpPrice: 99.3 }), st3, c(T + 66));
+  check("空單逼近漲停 → 🚨 立刻回補（只提醒一次）", ev.length === 1 && ev[0].type === "nearLimitUp" && formatEvent(sh, {}, ev[0], "x").startsWith("🚨 逼近漲停")
+    && evaluateItem(sh, q(97.5, { toLimitUpPercent: 1.5 }), st3, c(T + 72)).length === 0);
+  const st4 = newSymbolState();
+  ev = evaluateItem(sh, q(100), st4, c(T));
+  check("空方漲破失效價 → 失效", ev.length === 1 && ev[0].type === "invalid" && /漲破失效價 100/.test(ev[0].reason));
+  const st5 = newSymbolState();
+  ev = evaluateItem(sh, q(97, { canBuyFirstDayTradeOnly: true }), st5, c(T));
+  check("盤中變成只能先買後賣 → 空方失效", ev.length === 1 && ev[0].type === "invalid" && /先賣後買/.test(ev[0].reason));
+  const st6 = newSymbolState();
+  ev = evaluateItem(wls.items[0], q(55, { canBuyFirstDayTradeOnly: true }), st6, c(T));
+  check("只能先買後賣不影響多方", !ev.some((e) => e.type === "invalid"));
+  const st7 = newSymbolState();
+  ev = evaluateItem(sh, q(92.8, { openGapPercent: -2 }), st7, c(T));
+  ev = evaluateItem(sh, q(96.1, { openGapPercent: -2 }), st7, c(T + 30));
+  check("空方開低走高漲破放棄價 → 放棄", ev.length === 1 && ev[0].type === "abandon" && formatEvent(sh, {}, ev[0], "x").includes("漲破 96"));
+
+  const Q = (o) => Object.fromEntries(Object.entries(o).map(([k, v]) => [k, { name: k, changePercent: v, isToday: true }]));
+  let r = evalMarketGuard(wls.marketGuard, Q({ IX0001: 1.3, 2330: 0.8 }), false, "short");
+  check("大盤 +1.3%（門檻 1.2%）→ 暫停做空", r.paused && r.changed);
+  check("同樣行情不暫停做多", !evalMarketGuard(wls.marketGuard, Q({ IX0001: 1.3, 2330: 0.8 }), false).paused);
+  r = evalMarketGuard(wls.marketGuard, Q({ IX0001: 0.6, 2330: 0.5 }), true, "short");
+  check("漲幅回落到 0.6% → 恢復做空", !r.paused && r.changed);
+  let pg = evalPeerGuard(sh, Q({ 6770: 1.5 }), false);
+  check("空方同業平均漲 1.5%（門檻 1%）→ 暫停放空", pg.paused && pg.changed);
+  check("空方同業下跌不暫停", !evalPeerGuard(sh, Q({ 6770: -3 }), false).paused);
+
+  const ann = fa(wls);
+  check("公告分多空兩區、空方標示與保護", ann.includes("🟢 多方") && ann.includes("🔻 空方（先賣後買）") && ann.includes("🔻2303 聯電") && ann.includes("漲破 100 失效") && ann.includes("≤ 97.4") && ann.includes("漲破 96 放棄") && ann.includes("平均漲逾 1% 時暫停放空") && ann.includes("漲逾 1.2% 時暫停做空進場") && ann.includes("借券"));
+  console.log("---- 多空公告預覽 ----\n" + ann + "\n------------------");
+
+  // 端到端：大盤急漲只暫停空方，多方照常進場
+  const mem = new Map(); let alarmAt = null;
+  const doObj = new WatchMonitor({ storage: {
+    get: async (k) => (mem.has(k) ? structuredClone(mem.get(k)) : undefined),
+    put: async (k, v) => { mem.set(k, structuredClone(v)); },
+    getAlarm: async () => alarmAt, setAlarm: async (t) => { alarmAt = t; },
+  } }, env);
+  mem.set("watchlist", validateWatchlist({ date: "2026-10-21", items: [
+    { symbol: "6770", name: "力積電", invalidBelow: 50, entries: [{ id: "flat", when: "flat", priceAbove: 54.3 }] },
+    { symbol: "2303", name: "聯電", side: "short", invalidAbove: 100, entries: [{ id: "flat", when: "flat", priceBelow: 97.4 }] },
+  ] }));
+  const px = { 6770: 54.5, 2303: 97, IX0001: 1.8, 2330: 0.9 };
+  setMonitorDeps({ getDailyHistory: async () => ({ candles: [] }), getQuotes: async (_e, { symbols }) => ({ quotes: symbols.map((x) =>
+    x === "IX0001" || x === "2330" ? { symbol: x, name: x === "IX0001" ? "加權指數" : "台積電", changePercent: px[x], isToday: true }
+      : { symbol: x, name: x, lastPrice: px[x], openGapPercent: 0, changePercent: 0, isToday: true, canDayTrade: true, matchingIntervalSeconds: 0 }) }) });
+  const rn = Date.now; const base = sent.length;
+  Date.now = () => at("10:00").getTime(); await doObj.alarm();
+  const got = sent.slice(base).map((m) => m.text);
+  check("大盤 +1.8%：推播暫停做空、多方照常發進場、空方不發", got.some((t) => t.startsWith("⚠️ 大盤急漲，暫停做空進場")) && got.some((t) => t.startsWith("🟢 當沖條件成立｜6770")) && !got.some((t) => t.startsWith("🔻 放空條件成立")));
+  const stt = await watchStatus({ ...env, MONITOR: { idFromName: () => "x", get: () => ({ fetch: (u, i) => doObj.fetch(new Request(u, i)) }) } }, at("10:01"));
+  check("watchStatus 顯示空方欄位與暫停狀態", stt.items[1].side === "short" && stt.items[1].invalidAbove === 100 && stt.items[1].entries[0].priceBelow === 97.4 && stt.marketGuard.pausedShort === true);
+  Date.now = rn;
+}
+
+// ---------- MCP：空方寫入時檢查暫停先賣後買 ----------
+{
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    const u = new URL(String(url));
+    if (u.hostname === "openapi.twse.com.tw") {
+      if (u.pathname.endsWith("/exchangeReport/TWTB4U")) return new Response(JSON.stringify([
+        { Date: "1151020", Code: "2303", Name: "聯電", Suspension: "" },
+        { Date: "1151020", Code: "2344", Name: "華邦電", Suspension: "Y" },
+      ]));
+      return new Response("[]");
+    }
+    return realFetch(url, init);
+  };
+  const rn = Date.now; Date.now = () => at("06:05").getTime();
+  const call = async (args) => (await (await worker.fetch(new Request(`https://x.dev/mcp/${TOKEN}`, { method: "POST", body: JSON.stringify({
+    jsonrpc: "2.0", id: 20, method: "tools/call", params: { name: "set_daytrade_watchlist", arguments: args } }) }), env)).json()).result;
+  const bad = await call({ date: "2026-10-21", items: [{ symbol: "2344", name: "華邦電", side: "short", invalidAbove: 130, entries: [{ when: "flat", priceBelow: 118 }] }] });
+  check("暫停先賣後買的上市股放空 → 拒絕寫入", bad.isError === true && bad.content[0].text.includes("暫停先賣後買") && bad.content[0].text.includes("2344"));
+  const before = sent.length;
+  const good = await call({ date: "2026-10-21", criteria: ["空方：暫停先賣後買排除"], items: [{ symbol: "2303", name: "聯電", side: "short", invalidAbove: 100, entries: [{ id: "flat", when: "flat", label: "開平跌破 97.4", priceBelow: 97.4, holdMinutes: 2 }] }] });
+  check("可先賣後買的上市股放空 → 寫入並推播", !good.isError && JSON.parse(good.content[0].text).items[0].startsWith("🔻 2303") && sent.length === before + 1 && sent.at(-1).text.includes("🔻 空方（先賣後買）"));
+  Date.now = rn;
+  globalThis.fetch = realFetch;
+}
+
+// ---------- 週選股推播 ----------
+{
+  const { validatePicksMessage, formatPicksMessage } = await import("../src/picks.js");
+  const pick = { code: "2412", name: "中華電", tier: "mid-large", thesisType: "獲利驅動", refPrice: 163.5, entryLow: 158, entryHigh: 161.5, stop: 146, target: 176,
+    horizon: "2–6 週", settleBy: "2026-12-04", thesis: ["Q3 EPS 1.57 超出財測高標（11/4 法說）"], risks: ["本益比約 32 倍"], invalidatedIf: "收盤跌破 146" };
+  check("週選股：kind 不合法 → 錯誤", throws(() => validatePicksMessage({ kind: "x", date: "2026-11-09" })));
+  check("週選股：停損不低於進場區間 → 錯誤", throws(() => validatePicksMessage({ kind: "new_picks", date: "2026-11-09", picks: [{ ...pick, stop: 159 }] })));
+  check("週選股：目標不高於進場區間 → 錯誤", throws(() => validatePicksMessage({ kind: "new_picks", date: "2026-11-09", picks: [{ ...pick, target: 160 }] })));
+  check("週選股：daily_alerts 沒有觸發 → 錯誤", throws(() => validatePicksMessage({ kind: "daily_alerts", date: "2026-11-09", alerts: [] })));
+  const t1 = formatPicksMessage(validatePicksMessage({ kind: "new_picks", date: "2026-11-09", week: "2026-W46", strategyVersion: 3, note: "市場濾網成立，本週只選一檔中大型", picks: [{ ...pick, shares: 155, sizeNote: "25,000 元" }] }));
+  check("新推薦推播內容", t1.startsWith("📈 11/9（一） 本週選股（2026-W46）｜策略 v3") && t1.includes("2412 中華電｜中大型｜獲利驅動") && t1.includes("進場 158–161.5") && t1.includes("停損 146（收盤跌破，距進場中值 -8.6%）") && t1.includes("目標 176（+10.2%）") && t1.includes("12/4（五）結算") && t1.includes("看錯條件：收盤跌破 146"));
+  check("新推薦不含部位等個人資訊", !t1.includes("155") && !t1.includes("25,000"));
+  console.log("---- 週選股推播預覽 ----\n" + t1 + "\n------------------");
+  const t2 = formatPicksMessage(validatePicksMessage({ kind: "daily_alerts", date: "2026-11-10", alerts: [
+    { code: "2412", name: "中華電", type: "entry", close: 160, note: "最低 158.5 首次進入進場區間" },
+    { code: "1101", name: "台泥", type: "stop", close: 24.8, note: "收盤跌破停損 24.9", settlement: { verdict: "失敗", planPnlPct: -8.33 } },
+  ] }));
+  check("每日檢查推播內容", t2.startsWith("🔔 11/10（二） 週選股每日檢查") && t2.includes("✅ 進入進場區間｜2412 中華電｜收 160") && t2.includes("🔴 跌破停損｜1101 台泥") && t2.includes("已提前結算：失敗，照計畫 -8.33%"));
+  const t3 = formatPicksMessage(validatePicksMessage({ kind: "weekly_review", date: "2026-11-13", strategyVersion: 3, items: [
+    { code: "2412", name: "中華電", status: "open", lastPrice: 162, pctFromRef: -0.92, thesisStatus: "成立中", weeksLeft: 3, note: "10 月營收年增 18%" },
+    { code: "1101", name: "台泥", status: "settled", verdict: "失敗", planPnlPct: -8.33, early: true },
+  ], record: { success: 0, partial: 0, fail: 5, noEntry: 1, avgPnlPct: -9.93, enteredCount: 5 }, strategyNote: "維持 v3 不變（本週僅累積觀察）" }));
+  check("週報推播內容", t3.startsWith("📊 11/13（五） 週選股週報｜策略 v3") && t3.includes("2412 中華電｜收 162｜相對基準 -0.92%｜理由成立中｜距結算 3 週") && t3.includes("1101 台泥｜失敗｜照計畫 -8.33%（提前結算）") && t3.includes("累計戰績：成立 0、部分成立 0、失敗 5、未進場 1；有進場平均 -9.93%（5 檔）") && t3.includes("樣本數仍小") && t3.includes("策略：維持 v3"));
+  const before = sent.length;
+  const res = await (await worker.fetch(new Request(`https://x.dev/mcp/${TOKEN}`, { method: "POST", body: JSON.stringify({
+    jsonrpc: "2.0", id: 30, method: "tools/call", params: { name: "announce_weekly_picks", arguments: { kind: "new_picks", date: "2026-11-09", picks: [pick] } } }) }), env)).json();
+  check("MCP announce_weekly_picks 推播到 Telegram", !res.result.isError && JSON.parse(res.result.content[0].text).ok === true && sent.length === before + 1 && sent.at(-1).text.includes("2412 中華電"));
+  const badRes = await (await worker.fetch(new Request(`https://x.dev/mcp/${TOKEN}`, { method: "POST", body: JSON.stringify({
+    jsonrpc: "2.0", id: 31, method: "tools/call", params: { name: "announce_weekly_picks", arguments: { kind: "new_picks", date: "2026-11-09", picks: [{ ...pick, stop: 170 }] } } }) }), env)).json();
+  check("MCP announce_weekly_picks 參數錯誤 → isError、不推播", badRes.result.isError === true && sent.length === before + 1);
+}
+
 process.exit(failed ? 1 : 0);
