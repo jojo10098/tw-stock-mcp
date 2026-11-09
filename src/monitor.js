@@ -291,6 +291,7 @@ export function validateWatchlist(input) {
   return {
     date,
     noNewEntryAfter,
+    preAlert: input?.preAlert !== false,
     criteria: strList(input?.criteria, 10, 80),
     marketGuard: validateMarketGuard(input?.marketGuard),
     noPickReason: input?.noPickReason ? String(input.noPickReason).slice(0, 200) : undefined,
@@ -304,7 +305,7 @@ export function validateWatchlist(input) {
 // ---------------------------------------------------------------------------
 
 export function newSymbolState() {
-  return { invalidated: false, fired: {}, abandoned: {}, holdSince: {}, positions: {}, log: [] };
+  return { invalidated: false, fired: {}, abandoned: {}, holdSince: {}, prealerted: {}, positions: {}, log: [] };
 }
 
 /**
@@ -400,10 +401,21 @@ export function evaluateItem(item, quote, st, ctx) {
       continue;
     }
 
-    let ok = short ? price <= e.priceBelow : price >= e.priceAbove;
-    if (ok && e.minVolumeRatio != null) ok = volRatio != null && volRatio >= e.minVolumeRatio;
-    if (!ok) {
+    const priceOk = short ? price <= e.priceBelow : price >= e.priceAbove;
+    const volOk = e.minVolumeRatio == null || (volRatio != null && volRatio >= e.minVolumeRatio);
+    // 兩段通知第一段：價格一碰到觸發價就先發「準備中」（量能或站穩時間還沒到），每個條件只發一次
+    const preAlert = () => {
+      if (!ctx.preAlert || st.prealerted[e.id]) return;
+      const holdLeftSec = volOk && st.holdSince[e.id] != null
+        ? Math.max(0, (e.holdMinutes - 1) * 60 - (nowSec - st.holdSince[e.id]))
+        : (e.holdMinutes - 1) * 60;
+      st.prealerted[e.id] = { at: ctx.hhmm, price };
+      events.push({ type: "prealert", entry: e, price, scenario, volRatio, volMethod, volDays, volOk, holdLeftSec });
+    };
+    st.prealerted ??= {};
+    if (!(priceOk && volOk)) {
       delete st.holdSince[e.id];
+      if (priceOk) preAlert();
       continue;
     }
     // 「連續成立 N 分鐘」：從第一次成立起算，持續 (N−1)×60 秒仍成立就觸發（N=1 為立即觸發）
@@ -413,9 +425,25 @@ export function evaluateItem(item, quote, st, ctx) {
       st.fired[e.id] = { at: ctx.hhmm, price };
       st.positions[e.id] = { id: e.id, label: e.label, side: short ? "short" : "long", entryPrice: price, stop: levels.stop, target: levels.target, at: ctx.hhmm, status: "open" };
       events.push({ type: "entry", entry: e, price, scenario, volRatio, volMethod, volDays, levels });
+    } else {
+      preAlert();
     }
   }
   return events;
+}
+
+/** 「準備中」通知的等待說明：還差什麼才會成立 */
+function preAlertWaiting(ev) {
+  const parts = [];
+  if (!ev.volOk) {
+    const now = ev.volRatio != null ? `目前 ${ev.volRatio.toFixed(2)} 倍` : "目前無法估算";
+    parts.push(`量比需 ≥ ${ev.entry.minVolumeRatio}（${now}）`);
+  }
+  if (ev.holdLeftSec > 0) {
+    const m = Math.ceil(ev.holdLeftSec / 60);
+    parts.push(ev.volOk ? `再站穩約 ${m} 分鐘` : `量能到位後需連續站穩 ${ev.entry.holdMinutes} 分鐘`);
+  }
+  return parts.length ? `等待：${parts.join("；")}` : "等待確認";
 }
 
 // ---------------------------------------------------------------------------
@@ -524,6 +552,16 @@ export function formatEvent(item, quote, ev, hhmm) {
     ev.volRatio != null
       ? `量能：累計 ${fmt(quote?.tradeVolume)} 張，為${how}的 ${ev.volRatio.toFixed(1)} 倍`
       : `量能：累計 ${fmt(quote?.tradeVolume)} 張`;
+  if (ev.type === "prealert") {
+    const lvl = short ? `跌破 ${fmt(ev.entry.priceBelow)}` : `站上 ${fmt(ev.entry.priceAbove)}`;
+    return [
+      `🟡 ${short ? "放空" : "當沖"}準備中｜${title}`,
+      `劇本：${SCENARIO_LABEL[ev.scenario]}｜${ev.entry.label}`,
+      `現價 ${fmt(ev.price)}（${hhmm}）已${lvl}｜今日 ${chg}`,
+      preAlertWaiting(ev),
+      `先打開分時與五檔盯盤；條件確認後會再發「${short ? "放空" : "當沖"}條件成立」。`,
+    ].join("\n");
+  }
   if (short) return formatShortEvent(title, chg, vol, ev, hhmm);
   if (ev.type === "entry") {
     const lot = Math.round(ev.price * 1000);
@@ -913,7 +951,7 @@ export async function runMonitorTick(env, now, deps) {
       }
       const marketBlocked = sideOf(it) === "short" ? state.guard.marketPausedShort : state.guard.marketPaused;
       const blockEntries = marketBlocked || st.peerPaused === true;
-      const events = evaluateItem(it, quote, st, { minute: t.minute, sec: t.sec, hhmm: t.hhmmss, noNewEntryMin, volBase: state.volBase[it.symbol], blockEntries });
+      const events = evaluateItem(it, quote, st, { minute: t.minute, sec: t.sec, hhmm: t.hhmmss, noNewEntryMin, volBase: state.volBase[it.symbol], blockEntries, preAlert: wl.preAlert !== false });
       for (const ev of events) {
         st.log.push({ at: t.hhmmss, type: ev.type, id: ev.entry?.id ?? ev.pos?.id ?? null, price: ev.price });
         messages.push(formatEvent(it, quote, ev, t.hhmmss));
@@ -987,7 +1025,8 @@ export async function watchStatus(env, now = new Date(Date.now())) {
           minVolumeRatio: e.minVolumeRatio,
           abandonBelow: e.abandonBelow,
           abandonAbove: e.abandonAbove,
-          status: st?.fired?.[e.id] ? `已觸發 ${st.fired[e.id].at} @ ${st.fired[e.id].price}` : st?.abandoned?.[e.id] ? "已放棄" : "監控中",
+          status: st?.fired?.[e.id] ? `已觸發 ${st.fired[e.id].at} @ ${st.fired[e.id].price}` : st?.abandoned?.[e.id] ? "已放棄" : st?.prealerted?.[e.id] ? `準備中（${st.prealerted[e.id].at} @ ${st.prealerted[e.id].price} 已碰觸發價）` : "監控中",
+          prealert: st?.prealerted?.[e.id] ?? null,
         })),
         invalidated: st?.invalidated ?? false,
         peers: it.peers ?? [],
