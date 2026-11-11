@@ -4,6 +4,7 @@
  * 資料來源：
  *   - 富果 Fugle MarketData API v1.0（盤中即時行情，需金鑰，有次數限制）
  *   - 臺灣證券交易所 OpenAPI（盤後資料：本益比、融資融券、當沖標的、注意／處置股；免金鑰，不吃富果額度）
+ *   - 籌碼面（chips.js）：證交所 T86／櫃買中心三大法人、集保股權分散（免費官方資料，不吃富果額度）
  * 傳輸方式：MCP Streamable HTTP（無狀態，每個 POST 直接回 JSON）
  *
  * 需要的 Secrets（在 Cloudflare 後台設定，不要寫進程式碼）：
@@ -16,11 +17,12 @@ const TWSE_BASE = "https://openapi.twse.com.tw/v1";
 const TWSE_CACHE_SECONDS = 600; // 證交所資料一天更新一次，快取 10 分鐘足夠
 import { WatchMonitor, validateWatchlist, kvGet, kvPut, formatWatchlistAnnouncement, runMonitorTick, watchStatus, armMonitor, setMonitorDeps, sendTelegram, taipeiParts, telegramChatIds } from "./monitor.js";
 import { validatePicksMessage, formatPicksMessage } from "./picks.js";
+import { getInstitutionalTrades, getInstitutionalRanking, getMajorHolders } from "./chips.js";
 
 export { WatchMonitor };
 setMonitorDeps({ getQuotes, getDailyHistory, getMinuteHistory });
 
-const SERVER_INFO = { name: "tw-stock-mcp", version: "0.7.0" };
+const SERVER_INFO = { name: "tw-stock-mcp", version: "0.8.0" };
 const SUPPORTED_PROTOCOLS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
 const INDEX_SYMBOLS = {
@@ -151,6 +153,44 @@ const TOOLS = [
     description:
       "【證交所 OpenAPI，僅上市股票，不吃富果額度】列出證交所最新公布的全部注意股（含原因）與處置股（含處置期間與措施），用來避開被處置的標的或找出異常熱門股。不含上櫃股票。",
     inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "get_institutional_trades",
+    description:
+      "【籌碼・免費官方資料，上市上櫃皆可，不吃富果額度】查詢個股最近 N 個交易日的三大法人買賣超（單位：張）：每日外資（外資及陸資，不含外資自營商）、投信、自營商（自行＋避險）、三大法人合計，以及外資與投信的連續買賣超天數（foreignStreak／trustStreak：+N＝連 N 日買超、-N＝連 N 日賣超）與區間累計。資料為盤後公布（約 15:00–16:30），開盤前查詢最新一筆即前一交易日。一次最多 30 檔；days 1–8，預設 5。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        symbols: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 30, description: "股票代號陣列，例如 [\"2330\", \"8046\"]" },
+        days: { type: "integer", minimum: 1, maximum: 8, description: "要幾個交易日，預設 5" },
+      },
+      required: ["symbols"],
+    },
+  },
+  {
+    name: "get_institutional_ranking",
+    description:
+      "【籌碼・免費官方資料，上市上櫃合併，不吃富果額度】最近一個已公布交易日的三大法人買賣超排行（單位：張）：外資買超／賣超、投信買超／賣超、三大法人合計買超／賣超，各取前 N 名。預設只含一般個股（排除 ETF、權證），includeEtf=true 可納入 ETF。用來寫晨報資金流向的「法人買賣超前五」與找法人大額進出的候選股。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        top: { type: "integer", minimum: 1, maximum: 30, description: "每個排行取幾名，預設 10" },
+        includeEtf: { type: "boolean", description: "是否納入 ETF，預設 false" },
+      },
+    },
+  },
+  {
+    name: "get_major_holders",
+    description:
+      "【籌碼・集保股權分散，上市上櫃興櫃皆可，不吃富果額度】查詢個股最新一週的大戶持股：千張大戶（1,000 張以上）持股 % 與人數、400 張以上持股 % 與人數、50 張以下散戶持股 %、總股東人數，以及與上一週相比的變化（weekOverWeek，單位為百分點）與近幾週序列（history，新到舊）。大戶比例上升且股東人數減少＝籌碼集中。資料每週更新一次（通常為週五資料、週六前後公布），伺服器每週自行保存快照，所以週增減要從第二週起才有。一次最多 30 檔；weeks 1–12，預設 4。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        symbols: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 30, description: "股票代號陣列，例如 [\"2330\", \"2344\"]" },
+        weeks: { type: "integer", minimum: 1, maximum: 12, description: "history 要幾週，預設 4" },
+      },
+      required: ["symbols"],
+    },
   },
   {
     name: "set_daytrade_watchlist",
@@ -909,7 +949,15 @@ const HANDLERS = {
   set_daytrade_watchlist: setDaytradeWatchlist,
   get_daytrade_watchlist: getDaytradeWatchlist,
   announce_weekly_picks: announceWeeklyPicks,
+  get_institutional_trades: getInstitutionalTrades,
+  get_institutional_ranking: getInstitutionalRanking,
+  get_major_holders: (env, args) => getMajorHolders(env, args, chipStore(env)),
 };
+
+// 集保週快照存在 Durable Object（與盤中監控共用）；沒有綁定時只能回最新一週
+function chipStore(env) {
+  return env.MONITOR ? { get: (k) => kvGet(env, k), put: (k, v) => kvPut(env, k, v) } : null;
+}
 
 // ---------------------------------------------------------------------------
 // MCP JSON-RPC
@@ -939,7 +987,7 @@ async function handleRpc(env, msg) {
         capabilities: { tools: { listChanged: false } },
         serverInfo: SERVER_INFO,
         instructions:
-          "台股行情。富果 API（上市上櫃皆可，每分鐘 60 次額度）：查價、漲跌停與可否現沖用 get_quotes；大盤背景用 get_market_overview；開盤後走勢與量能用 get_intraday_candles；近 N 日量價、振幅、均線用 get_daily_history。證交所 OpenAPI（前一交易日盤後資料，僅上市股票，不吃富果額度）：當沖前先用 get_daytrade_status 確認可否當沖、是否注意／處置；個股融資融券用 get_margin_trading；估值用 get_valuation；全部注意／處置股用 get_alert_lists。注意時段：開盤前或休市日，盤中工具回傳的是最近一個交易日資料，請看 isToday／date。盤中監控：set_daytrade_watchlist 寫入當日當沖條件後，伺服器每數秒自動檢查並以 Telegram 通知（含進場後的停損、第一目標與保本通知）；get_daytrade_watchlist 查看狀態；做空當沖在該檔設 side:\"short\" 並用 priceBelow／invalidAbove。週選股推播：announce_weekly_picks（新推薦、每日檢查觸發、週五週報）。所有工具的個股成交量單位一律為「張」，成交金額為「元」；所有時間為台北時間。",
+          "台股行情。富果 API（上市上櫃皆可，每分鐘 60 次額度）：查價、漲跌停與可否現沖用 get_quotes；大盤背景用 get_market_overview；開盤後走勢與量能用 get_intraday_candles；近 N 日量價、振幅、均線用 get_daily_history。證交所 OpenAPI（前一交易日盤後資料，僅上市股票，不吃富果額度）：當沖前先用 get_daytrade_status 確認可否當沖、是否注意／處置；個股融資融券用 get_margin_trading；估值用 get_valuation；全部注意／處置股用 get_alert_lists。籌碼面（免費官方資料，上市上櫃皆可）：個股三大法人買賣超與連買天數用 get_institutional_trades；全市場法人買賣超排行用 get_institutional_ranking；千張大戶持股與週增減用 get_major_holders。注意時段：開盤前或休市日，盤中工具回傳的是最近一個交易日資料，請看 isToday／date。盤中監控：set_daytrade_watchlist 寫入當日當沖條件後，伺服器每數秒自動檢查並以 Telegram 通知（含進場後的停損、第一目標與保本通知）；get_daytrade_watchlist 查看狀態；做空當沖在該檔設 side:\"short\" 並用 priceBelow／invalidAbove。週選股推播：announce_weekly_picks（新推薦、每日檢查觸發、週五週報）。所有工具的個股成交量單位一律為「張」，成交金額為「元」；所有時間為台北時間。",
       });
     }
     case "ping":
@@ -1085,6 +1133,20 @@ export default {
       } catch (e) {
         out.ok = false;
         out.twse = { ok: false, message: e.message };
+      }
+      if (url.searchParams.get("chips") === "1") {
+        for (const [k, fn] of [
+          ["institutional", () => getInstitutionalTrades(env, { symbols: ["2330", "8046"], days: 2 })],
+          ["majorHolders", () => getMajorHolders(env, { symbols: ["2330"], weeks: 2 }, chipStore(env))],
+        ]) {
+          try {
+            const r = await fn();
+            out[k] = { ok: true, sample: r.results, dataDates: r.dataDates ?? r.latestDate, sourceErrors: r.sourceErrors };
+          } catch (e) {
+            out.ok = false;
+            out[k] = { ok: false, message: e.message };
+          }
+        }
       }
       return json(out);
     }
