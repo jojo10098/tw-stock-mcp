@@ -179,6 +179,7 @@ const lastArgs = {
 const setRes = await worker.fetch(new Request(`https://x.dev/mcp/${TOKEN}`, { method: "POST", body: JSON.stringify({
   jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "set_daytrade_watchlist", arguments: {
     date: "2026-10-21",
+    preAlert: false, // 這段測舊有通知流程；兩段通知另有測試
     items: [
       { symbol: "2409", name: "友達", prevClose: 20, invalidBelow: 19.5, entries: [{ id: "fl", when: "flat", label: "開平突破 20.3", priceAbove: 20.3, holdMinutes: 2 }] },
       { symbol: "2002", name: "中鋼", prevClose: 22, invalidBelow: 21.6, entries: [{ id: "fl", when: "flat", label: "開平突破 22.2", priceAbove: 22.2 }] },
@@ -197,7 +198,7 @@ console.log("---- 公告預覽 ----\n" + sent[0].text + "\n------------------");
   console.log("---- 公告預覽（完整） ----\n" + sent[1].text + "\n------------------");
   check("同一天重寫 → 標示更新", sent.length === 2 && sent[1].text.includes("（更新）") && !again.result.isError);
   await worker.fetch(new Request(`https://x.dev/mcp/${TOKEN}`, { method: "POST", body: JSON.stringify({
-    jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "set_daytrade_watchlist", arguments: { ...lastArgs, announce: false } } }) }), env);
+    jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "set_daytrade_watchlist", arguments: { ...lastArgs, announce: false, preAlert: false } } }) }), env);
   check("announce=false 不推播", sent.length === 2);
 }
 sent.length = 0;
@@ -550,6 +551,63 @@ Date.now = realNow;
   const badRes = await (await worker.fetch(new Request(`https://x.dev/mcp/${TOKEN}`, { method: "POST", body: JSON.stringify({
     jsonrpc: "2.0", id: 31, method: "tools/call", params: { name: "announce_weekly_picks", arguments: { kind: "new_picks", date: "2026-11-09", picks: [{ ...pick, stop: 170 }] } } }) }), env)).json();
   check("MCP announce_weekly_picks 參數錯誤 → isError、不推播", badRes.result.isError === true && sent.length === before + 1);
+}
+
+// ---------- 兩段通知（準備中 → 成立） ----------
+{
+  const wlp = validateWatchlist({ date: "2026-11-09", items: [
+    { symbol: "6770", name: "力積電", prevClose: 52.9, invalidBelow: 51.5,
+      entries: [{ id: "high", when: "high", label: "開高站上 54.8", priceAbove: 54.8, holdMinutes: 3, minVolumeRatio: 1.3, abandonBelow: 52.8 }] },
+    { symbol: "2002", name: "中鋼", prevClose: 22, entries: [{ id: "fl", when: "flat", priceAbove: 22.2 }] },
+  ] });
+  check("preAlert 預設開啟、可關閉", wlp.preAlert === true && validateWatchlist({ date: "2026-11-09", items: [], preAlert: false }).preAlert === false);
+  const it = wlp.items[0];
+  const st = newSymbolState();
+  const base = { method: "linear", avgVol5: 100000 };
+  const ctx = (hhmmss, extra = {}) => {
+    const [h, m, s] = hhmmss.split(":").map(Number);
+    return { minute: h * 60 + m, sec: h * 3600 + m * 60 + s, hhmm: hhmmss, noNewEntryMin: 750, volBase: base, preAlert: true, ...extra };
+  };
+  const q = (price, vol) => ({ lastPrice: price, tradeVolume: vol, openGapPercent: 1.63, changePercent: 3.6, isToday: true, canDayTrade: true, matchingIntervalSeconds: 0 });
+  // 09:09 站上 54.8 但量比不足（預期 3333 張 ×1.3 = 4333）
+  let ev = evaluateItem(it, q(55.2, 3000), st, ctx("09:09:05"));
+  check("價格到、量不足 → 發「準備中」", ev.length === 1 && ev[0].type === "prealert" && ev[0].volOk === false);
+  const txt = formatEvent(it, q(55.2, 3000), ev[0], "09:09:05");
+  check("準備中文字說明還差什麼", txt.startsWith("🟡 當沖準備中｜6770 力積電") && txt.includes("量比需 ≥ 1.3") && txt.includes("連續站穩 3 分鐘"));
+  ev = evaluateItem(it, q(55.3, 3200), st, ctx("09:09:10"));
+  check("準備中只發一次", ev.length === 0);
+  ev = evaluateItem(it, q(57.0, 12000), st, ctx("09:20:00"));
+  check("量能到位、站穩中 → 不重發", ev.length === 0 && st.holdSince.high != null);
+  ev = evaluateItem(it, q(58.1, 14000), st, ctx("09:22:00"));
+  check("連續站穩 3 分鐘 → 成立", ev.length === 1 && ev[0].type === "entry");
+
+  // 立即成立（holdMinutes 1、無量能條件）→ 不另發準備中
+  const st2 = newSymbolState();
+  const it2 = wlp.items[1];
+  ev = evaluateItem(it2, { ...q(22.3, 100), openGapPercent: 0.2 }, st2, ctx("09:30:00"));
+  check("同一刻就成立 → 只發成立、不發準備中", ev.length === 1 && ev[0].type === "entry" && !st2.prealerted.fl);
+
+  // 量能已到、只差站穩時間 → 準備中寫出剩餘分鐘
+  const st3 = newSymbolState();
+  ev = evaluateItem(it, q(55.0, 20000), st3, ctx("09:10:00"));
+  check("量已到、等站穩 → 準備中含剩餘時間", ev.length === 1 && ev[0].type === "prealert" && ev[0].volOk && ev[0].holdLeftSec === 120 && formatEvent(it, q(55, 20000), ev[0], "09:10:00").includes("再站穩約 2 分鐘"));
+
+  // ctx.preAlert 未開 → 舊行為
+  const st4 = newSymbolState();
+  ev = evaluateItem(it, q(55.2, 3000), st4, ctx("09:09:05", { preAlert: false }));
+  check("preAlert=false → 不發準備中", ev.length === 0);
+
+  // 大盤保護中 → 不發準備中
+  const st5 = newSymbolState();
+  ev = evaluateItem(it, q(55.2, 3000), st5, ctx("09:09:05", { blockEntries: true }));
+  check("保護暫停中 → 不發準備中", ev.length === 0);
+
+  // 空方
+  const wls = validateWatchlist({ date: "2026-11-09", items: [{ symbol: "2409", name: "友達", side: "short", invalidAbove: 21,
+    entries: [{ id: "lo", when: "any", priceBelow: 19.8, holdMinutes: 2 }] }] });
+  const st6 = newSymbolState();
+  ev = evaluateItem(wls.items[0], { ...q(19.75, 5000), openGapPercent: -0.3, changePercent: -1.2 }, st6, ctx("09:15:00"));
+  check("空方準備中", ev.length === 1 && ev[0].type === "prealert" && formatEvent(wls.items[0], q(19.75, 5000), ev[0], "09:15:00").startsWith("🟡 放空準備中｜🔻2409 友達"));
 }
 
 process.exit(failed ? 1 : 0);
