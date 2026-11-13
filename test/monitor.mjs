@@ -325,7 +325,15 @@ Date.now = realNow;
   alarmAt = null; await doObj.alarm();
   check("13:25 之後不再排 alarm", alarmAt === null);
   Date.now = () => at("08:30").getTime();
-  check("盤前看門狗不排程", (await (await doObj.fetch(new Request("https://monitor/arm", { method: "POST" }))).json()).armed === false);
+  alarmAt = null;
+  const pre = await (await doObj.fetch(new Request("https://monitor/arm", { method: "POST" }))).json();
+  check("盤前寫入清單 → 預約 09:01 第一次檢查", pre.armed === true && pre.preOpen === true && alarmAt === at("09:01").getTime());
+  const callsBefore = calls;
+  Date.now = () => at("08:59").getTime() + 30000;
+  await doObj.alarm();
+  check("alarm 提早觸發（09:00 前）→ 不查價、改排到 09:01", calls === callsBefore && alarmAt === at("09:01").getTime());
+  Date.now = () => at("18:00").getTime();
+  check("收盤後看門狗不排程", (await (await doObj.fetch(new Request("https://monitor/arm", { method: "POST" }))).json()).armed === false);
   Date.now = rn;
 }
 
