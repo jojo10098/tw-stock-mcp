@@ -1,3 +1,5 @@
+import { runSwingTick, SWING_CHECK_SECONDS } from "./swing.js";
+
 /**
  * 當沖盤中監控
  *
@@ -686,13 +688,14 @@ export function formatWatchlistAnnouncement(wl, { isUpdate = false, test = false
 // Telegram
 // ---------------------------------------------------------------------------
 
-export async function sendTelegram(env, text) {
+export async function sendTelegram(env, text, { privateOnly = false } = {}) {
   if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
     console.log(JSON.stringify({ telegram: "not_configured", text: text.slice(0, 80) }));
     return { ok: false, reason: "未設定 TELEGRAM_BOT_TOKEN／TELEGRAM_CHAT_ID" };
   }
-  const chatIds = telegramChatIds(env);
-  if (!chatIds.length) return { ok: false, reason: "TELEGRAM_CHAT_ID 沒有有效的 id" };
+  // privateOnly：只送個人私訊（Telegram 個人 chat id 為正整數；頻道、群組為負數或 @名稱），用於含持股資訊的通知
+  const chatIds = telegramChatIds(env).filter((id) => !privateOnly || /^\d+$/.test(id));
+  if (!chatIds.length) return { ok: false, reason: privateOnly ? "TELEGRAM_CHAT_ID 中沒有個人私訊 id（正整數），持股通知不送頻道" : "TELEGRAM_CHAT_ID 沒有有效的 id" };
   // 多個收件者（私訊、頻道、群組）各自發送；一個失敗不影響其他
   const results = await Promise.all(chatIds.map((id) => sendOne(env, id, text)));
   const failed = results.filter((r) => !r.ok);
@@ -734,6 +737,13 @@ export function setMonitorDeps(deps) {
   MONITOR_DEPS = deps;
 }
 
+/** 平日開盤前：回傳今天 09:01:00（台北）的 epoch 毫秒；其他時間回傳 null */
+export function firstCheckAt(now) {
+  const t = taipeiParts(now);
+  if (t.weekday < 1 || t.weekday > 5 || t.minute >= OPEN_MIN + 1) return null;
+  return Date.parse(`${t.date}T09:01:00+08:00`);
+}
+
 /** 現在是否在需要排程檢查的時段（平日 09:00–13:25） */
 function inSession(now) {
   const t = taipeiParts(now);
@@ -747,30 +757,54 @@ export class WatchMonitor {
     this.env = env;
   }
 
-  // 盤中每 N 秒一次：alarm 執行檢查後再排下一次；Cron 每分鐘呼叫 /arm 當看門狗
+  // 盤中每 N 秒一次：alarm 執行檢查後再排下一次；Cron 每分鐘呼叫 /arm 當看門狗。
+  // 開盤前寫入清單時會預約 09:01 的第一次檢查，不必等 Cron 接手。
   async alarm() {
     const now = new Date(Date.now());
-    let n = 1;
-    let hasList = false;
+    const today = taipeiParts(now).date;
+    const store = { get: (k) => this.storage.get(k), put: (k, v) => this.storage.put(k, v) };
+    const wl = await this.storage.get("watchlist");
+    const sw = await this.storage.get("swing");
+    const hasDay = wl?.date === today && wl.items?.length > 0;
+    const hasSwing = sw?.date === today && sw.items?.length > 0;
+    if (!hasDay && !hasSwing) return;
+    if (!inSession(now)) {
+      // 早到（開盤前的預約）：改排到 09:01
+      const open = firstCheckAt(now);
+      if (open) await this.storage.setAlarm(open);
+      return;
+    }
     try {
-      const store = { get: (k) => this.storage.get(k), put: (k, v) => this.storage.put(k, v) };
-      const wl = await this.storage.get("watchlist");
-      n = wl?.items?.length || 1;
-      hasList = wl?.date === taipeiParts(now).date && wl.items?.length > 0;
-      if (MONITOR_DEPS) await runMonitorTick(this.env, now, { ...MONITOR_DEPS, store });
+      if (hasDay && MONITOR_DEPS) await runMonitorTick(this.env, now, { ...MONITOR_DEPS, store });
     } catch (e) {
       console.log(JSON.stringify({ alarmError: String(e?.message ?? e) }));
     }
-    const next = Date.now() + checkIntervalSeconds(this.env, n) * 1000;
-    if (hasList && inSession(new Date(next))) await this.storage.setAlarm(next);
+    try {
+      if (hasSwing && MONITOR_DEPS) await runSwingTick(this.env, now, { ...MONITOR_DEPS, store });
+    } catch (e) {
+      console.log(JSON.stringify({ swingAlarmError: String(e?.message ?? e) }));
+    }
+    const sec = hasDay ? checkIntervalSeconds(this.env, wl.items.length) : SWING_CHECK_SECONDS;
+    const next = Date.now() + sec * 1000;
+    if (inSession(new Date(next))) await this.storage.setAlarm(next);
   }
 
   async arm() {
-    if (!inSession(new Date(Date.now()))) return { armed: false, reason: "outside_session" };
+    const now = new Date(Date.now());
+    const today = taipeiParts(now).date;
     const wl = await this.storage.get("watchlist");
-    if (!wl || wl.date !== taipeiParts().date || !wl.items?.length) return { armed: false, reason: "no_watchlist_today" };
+    const sw = await this.storage.get("swing");
+    const hasDay = wl?.date === today && wl.items?.length > 0;
+    const hasSwing = sw?.date === today && sw.items?.length > 0;
+    if (!hasDay && !hasSwing) return { armed: false, reason: "no_watchlist_today" };
     const cur = await this.storage.getAlarm();
-    const interval = checkIntervalSeconds(this.env, wl.items.length);
+    if (!inSession(now)) {
+      const open = firstCheckAt(now);
+      if (!open) return { armed: false, reason: "outside_session" };
+      if (cur == null || Math.abs(cur - open) > 60 * 1000) await this.storage.setAlarm(open);
+      return { armed: true, preOpen: true, nextAt: open };
+    }
+    const interval = hasDay ? checkIntervalSeconds(this.env, wl.items.length) : SWING_CHECK_SECONDS;
     // 沒有排程，或排程時間異常（太遠）時重新排
     if (cur == null || cur > Date.now() + (interval + 5) * 1000) await this.storage.setAlarm(Date.now() + 200);
     return { armed: true, intervalSeconds: interval, nextAt: await this.storage.getAlarm() };

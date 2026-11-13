@@ -65,6 +65,7 @@ globalThis.fetch = async (url) => {
       data: [{ date: "2026-10-20T09:00:00.000+08:00", open: 101, high: 102, low: 100, close: 101.5, volume: 800, average: 101.2 }] }));
   }
   if (u.pathname.includes("/historical/candles/")) {
+    histRanges.push([u.searchParams.get("from"), u.searchParams.get("to")]);
     return new Response(JSON.stringify({ symbol: sym,
       data: [{ date: "2026-10-17", open: 98, high: 101, low: 97, close: 100, volume: 20000 },
              { date: "2026-10-16", open: 97, high: 99, low: 96, close: 98, volume: 18000 }] }));
@@ -72,6 +73,7 @@ globalThis.fetch = async (url) => {
   return new Response("nope", { status: 404 });
 };
 
+const histRanges = [];
 async function call(body, path = `/mcp/${TOKEN}`) {
   const res = await worker.fetch(new Request("https://x.dev" + path, {
     method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
@@ -86,7 +88,7 @@ const init = await call({ jsonrpc: "2.0", id: 1, method: "initialize", params: {
 check("initialize", init.body.result?.serverInfo?.name === "tw-stock-mcp");
 check("notification → 202", (await call({ jsonrpc: "2.0", method: "notifications/initialized" })).status === 202);
 const list = await call({ jsonrpc: "2.0", id: 2, method: "tools/list" });
-check("tools/list 有 14 個工具", list.body.result.tools.length === 14);
+check("tools/list 有 16 個工具", list.body.result.tools.length === 16);
 const q = await call({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "get_quotes", arguments: { symbols: ["2330", "IX0001"] } } });
 const qd = JSON.parse(q.body.result.content[0].text);
 check("get_quotes 跳空 1%", qd.quotes[0].openGapPercent === 1);
@@ -110,6 +112,10 @@ check("日 K 成交量 股→張", hd.candles[0].volume === 20 && hd.candles[1].
 check("振幅 ÷ 前一日收盤", hd.candles[0].amplitudePercent === 4.08 && hd.candles[0].changePercent === 2.04);
 check("最舊一天無前收 → null", hd.candles[1].amplitudePercent === null);
 check("includesToday 欄位", hd.includesToday === false && hd.latestDate === "2026-10-17");
+histRanges.length = 0;
+const hc = JSON.parse((await call({ jsonrpc: "2.0", id: 51, method: "tools/call", params: { name: "get_daily_history", arguments: { symbol: "2330", days: 250, format: "csv" } } })).body.result.content[0].text);
+check("days 250 → 分段查詢、每段不超過一年", histRanges.length === 2 && histRanges.every(([f, t]) => (Date.parse(t) - Date.parse(f)) / 86400000 <= 365));
+check("csv 舊到新、去重", hc.order === "舊到新" && hc.csv.split("\n").length === 3 && hc.csv.split("\n")[1].startsWith("2026-10-16,97,99,96,98,18"));
 const ci = JSON.parse((await call({ jsonrpc: "2.0", id: 41, method: "tools/call", params: { name: "get_intraday_candles", arguments: { symbol: "IX0001" } } })).body.result.content[0].text);
 check("指數分 K 改回傳 tradeValue", ci.candles[0].tradeValue === 800 && ci.candles[0].volume === undefined);
 check("過期分 K 有 note", ci.isToday === false && /不是今天/.test(ci.note));

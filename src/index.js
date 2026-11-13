@@ -15,6 +15,7 @@
 const FUGLE_BASE = "https://api.fugle.tw/marketdata/v1.0/stock";
 const TWSE_BASE = "https://openapi.twse.com.tw/v1";
 const TWSE_CACHE_SECONDS = 600; // 證交所資料一天更新一次，快取 10 分鐘足夠
+import { validateSwingList, swingStatus } from "./swing.js";
 import { WatchMonitor, validateWatchlist, kvGet, kvPut, formatWatchlistAnnouncement, runMonitorTick, watchStatus, armMonitor, setMonitorDeps, sendTelegram, taipeiParts, telegramChatIds } from "./monitor.js";
 import { validatePicksMessage, formatPicksMessage } from "./picks.js";
 import { getInstitutionalTrades, getInstitutionalRanking, getMajorHolders } from "./chips.js";
@@ -22,7 +23,7 @@ import { getInstitutionalTrades, getInstitutionalRanking, getMajorHolders } from
 export { WatchMonitor };
 setMonitorDeps({ getQuotes, getDailyHistory, getMinuteHistory });
 
-const SERVER_INFO = { name: "tw-stock-mcp", version: "0.8.0" };
+const SERVER_INFO = { name: "tw-stock-mcp", version: "0.9.0" };
 const SUPPORTED_PROTOCOLS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
 const INDEX_SYMBOLS = {
@@ -79,7 +80,7 @@ const TOOLS = [
   {
     name: "get_daily_history",
     description:
-      "查詢個股或指數最近 N 個交易日的日 K（上市上櫃都支援），新到舊排序（candles[0] 為最近一個交易日）。每天回傳開高低收、成交張數（volume，單位：張，已由股換算）、漲跌幅（changePercent），以及已算好的振幅（amplitudePercent ＝（最高 − 最低）÷ 前一日收盤），不需要自行換算。可用來計算均線、近 N 日均量、前高前低。時段：盤後約 16:30 才會更新當天資料，盤中查詢通常只到前一個交易日（看 includesToday）。額度 1 次（歷史行情另計，每分鐘 60 次）。",
+      "查詢個股或指數最近 N 個交易日的日 K（上市上櫃都支援，最多約一年 260 日；回測可用 format：csv 取得精簡資料），新到舊排序（candles[0] 為最近一個交易日）。每天回傳開高低收、成交張數（volume，單位：張，已由股換算）、漲跌幅（changePercent），以及已算好的振幅（amplitudePercent ＝（最高 − 最低）÷ 前一日收盤），不需要自行換算。可用來計算均線、近 N 日均量、前高前低。時段：盤後約 16:30 才會更新當天資料，盤中查詢通常只到前一個交易日（看 includesToday）。額度 1 次（歷史行情另計，每分鐘 60 次）。",
     inputSchema: {
       type: "object",
       properties: {
@@ -87,8 +88,13 @@ const TOOLS = [
         days: {
           type: "integer",
           minimum: 1,
-          maximum: 60,
-          description: "要幾個交易日，預設 10",
+          maximum: 260,
+          description: "要幾個交易日，預設 10，最多 260（約一年）",
+        },
+        format: {
+          type: "string",
+          enum: ["json", "csv"],
+          description: "json（預設）；csv＝精簡文字（date,open,high,low,close,volume，舊到新），適合抓長期資料做回測",
         },
       },
       required: ["symbol"],
@@ -263,6 +269,56 @@ const TOOLS = [
     name: "get_daytrade_watchlist",
     description:
       "【盤中監控】查看目前的當沖監控清單與今日狀態：每個條件是監控中、已觸發（時間與價格）或已放棄，哪些標的已失效，以及已送出的通知紀錄與 Telegram 是否設定完成。",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "set_swing_alerts",
+    description:
+      "【波段盤中通知】寫入今天的波段價位通知清單（覆蓋前一份，最多 12 檔、每檔 4 個 alert）。伺服器在台北 09:01–13:25 約每 60 秒查一次報價，價位成立（可設連續成立分鐘數 holdMinutes，預設 2；可設量比 minVolumeRatio＝今日累計量 ÷ 近 5 日同時刻平均累計量）就用 Telegram 通知，每個 alert 每天只通知一次。每檔：symbol、name、role（holding＝自己的持股，通知只送個人私訊、不送頻道；candidate＝候選股）、alerts。每個 alert：id、kind（entry 進場／stop 停損／target 目標／info 提醒）、label、priceAbove（現價 ≥ 此價）或 priceBelow（現價 ≤ 此價）擇一、holdMinutes、minVolumeRatio、action（一句建議動作）。不追蹤當沖的 1% 停損與平倉；波段停損以收盤為準，盤中只是提醒。開盤前寫入會預約 09:01 開始檢查。寫入後預設推播一則清單摘要（只送私訊）；announce=false 可關閉。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        date: { type: "string", description: "台北日期 YYYY-MM-DD" },
+        announce: { type: "boolean", description: "寫入後是否推播清單摘要到私訊，預設 true" },
+        items: {
+          type: "array",
+          maxItems: 12,
+          items: {
+            type: "object",
+            properties: {
+              symbol: { type: "string" },
+              name: { type: "string" },
+              role: { type: "string", enum: ["holding", "candidate"] },
+              note: { type: "string" },
+              alerts: {
+                type: "array",
+                minItems: 1,
+                maxItems: 4,
+                items: {
+                  type: "object",
+                  properties: {
+                    id: { type: "string" },
+                    kind: { type: "string", enum: ["entry", "stop", "target", "info"] },
+                    label: { type: "string" },
+                    priceAbove: { type: "number" },
+                    priceBelow: { type: "number" },
+                    holdMinutes: { type: "integer", minimum: 1, maximum: 30 },
+                    minVolumeRatio: { type: "number" },
+                    action: { type: "string" },
+                  },
+                },
+              },
+            },
+            required: ["symbol", "alerts"],
+          },
+        },
+      },
+      required: ["date", "items"],
+    },
+  },
+  {
+    name: "get_swing_alerts",
+    description: "【波段盤中通知】查看今天的波段通知清單、各 alert 是否已通知（時間與價格）與通知紀錄。",
     inputSchema: { type: "object", properties: {} },
   },
   {
@@ -619,16 +675,28 @@ async function getMinuteHistory(env, { symbol, today }) {
 async function getDailyHistory(env, args) {
   const symbol = normalizeSymbol(args?.symbol ?? "");
   if (!symbol) throw new Error("symbol 不可為空");
-  const days = Math.min(Math.max(parseInt(args?.days ?? 10, 10) || 10, 1), 60);
-  // 多抓一些日曆日，涵蓋假日
+  const days = Math.min(Math.max(parseInt(args?.days ?? 10, 10) || 10, 1), 260);
+  // 多抓一些日曆日，涵蓋假日；富果歷史 K 線單次查詢區間最多一年，超過就分段查再合併
   const to = new Date(Date.now() + 8 * 3600 * 1000);
-  const from = new Date(to.getTime() - (days * 2 + 14) * 86400 * 1000);
+  const spanDays = Math.ceil(days * 1.55) + 20;
   const fmt = (d) => d.toISOString().slice(0, 10);
-  const r = await fugle(env, `/historical/candles/${encodeURIComponent(symbol)}`, {
-    from: fmt(from),
-    to: fmt(to),
-    timeframe: "D",
-  });
+  const CHUNK = 360;
+  const data = [];
+  let resSymbol = null;
+  for (let end = to, left = spanDays; left > 0; left -= CHUNK) {
+    const len = Math.min(CHUNK, left);
+    const start = new Date(end.getTime() - len * 86400 * 1000);
+    const part = await fugle(env, `/historical/candles/${encodeURIComponent(symbol)}`, {
+      from: fmt(start),
+      to: fmt(end),
+      timeframe: "D",
+    });
+    resSymbol ??= part.symbol;
+    data.push(...(part.data || []));
+    end = new Date(start.getTime() - 86400 * 1000);
+  }
+  const uniq = [...new Map(data.map((c) => [c.date, c])).values()];
+  const r = { symbol: resSymbol, data: uniq };
   // 新到舊；多保留一天，用來算最舊那天的振幅（需要前一日收盤）
   const sorted = (r.data || []).slice().sort((a, b) => (a.date < b.date ? 1 : -1));
   const rows = sorted.slice(0, days).map((c, i) => {
@@ -648,6 +716,22 @@ async function getDailyHistory(env, args) {
     };
   });
   const today = taipeiToday();
+  if (args?.format === "csv") {
+    const lines = rows
+      .slice()
+      .reverse()
+      .map((c) => [c.date, c.open, c.high, c.low, c.close, c.volume].join(","));
+    return {
+      source: "富果 Fugle MarketData API",
+      symbol: r.symbol ?? symbol,
+      unit: "volume 為成交張數（已由股換算）",
+      order: "舊到新",
+      latestDate: rows[0]?.date ?? null,
+      includesToday: rows[0]?.date === today,
+      days: rows.length,
+      csv: "date,open,high,low,close,volume\n" + lines.join("\n"),
+    };
+  }
   return {
     source: "富果 Fugle MarketData API",
     symbol: r.symbol ?? symbol,
@@ -920,6 +1004,41 @@ async function setDaytradeWatchlist(env, args) {
   };
 }
 
+async function setSwingAlerts(env, args) {
+  if (!env.MONITOR) throw new Error("伺服器尚未設定 MONITOR（Durable Object）綁定");
+  const list = validateSwingList(args);
+  const today = taipeiParts().date;
+  if (list.date < today) throw new Error(`date ${list.date} 已經過去（今天是 ${today}）`);
+  await kvPut(env, "swing", list);
+  await kvPut(env, `swingstate:${list.date}`, null);
+  const armed = await armMonitor(env).catch((e) => ({ armed: false, reason: e.message }));
+  let announced = null;
+  if (args?.announce !== false && list.items.length) {
+    const lines = [`📋 今日波段價位通知（${list.date}）`];
+    for (const it of list.items) {
+      lines.push(`${it.role === "holding" ? "持股" : "候選"}｜${it.symbol} ${it.name}`);
+      for (const a of it.alerts) lines.push(`  · ${a.label}${a.minVolumeRatio ? `（量比 ≥ ${a.minVolumeRatio}）` : ""}`);
+    }
+    lines.push("09:01–13:25 約每分鐘檢查；價位到了才通知，每個條件每天一次。");
+    announced = await sendTelegram(env, lines.join("\n"), { privateOnly: true });
+  }
+  return {
+    ok: true,
+    date: list.date,
+    items: list.items.map((it) => `${it.symbol} ${it.name}（${it.role === "holding" ? "持股" : "候選"}）：${it.alerts.map((a) => a.label).join("、")}`),
+    armed,
+    announced: announced == null ? "未推播" : announced.ok ? `已推播到 ${announced.sentTo} 個私訊` : `推播失敗：${announced.reason}`,
+    note: "盤中約每 60 秒檢查；波段停損以收盤為準，盤中通知只是提醒。持股通知只送個人私訊。",
+  };
+}
+
+async function getSwingAlerts(env) {
+  if (!env.MONITOR) throw new Error("伺服器尚未設定 MONITOR（Durable Object）綁定");
+  const list = await kvGet(env, "swing");
+  const state = list ? await kvGet(env, `swingstate:${list.date}`) : null;
+  return swingStatus(list, state);
+}
+
 async function announceWeeklyPicks(env, args) {
   const msg = validatePicksMessage(args);
   const text = formatPicksMessage(msg);
@@ -948,6 +1067,8 @@ const HANDLERS = {
   get_alert_lists: getAlertLists,
   set_daytrade_watchlist: setDaytradeWatchlist,
   get_daytrade_watchlist: getDaytradeWatchlist,
+  set_swing_alerts: setSwingAlerts,
+  get_swing_alerts: getSwingAlerts,
   announce_weekly_picks: announceWeeklyPicks,
   get_institutional_trades: getInstitutionalTrades,
   get_institutional_ranking: getInstitutionalRanking,
@@ -987,7 +1108,7 @@ async function handleRpc(env, msg) {
         capabilities: { tools: { listChanged: false } },
         serverInfo: SERVER_INFO,
         instructions:
-          "台股行情。富果 API（上市上櫃皆可，每分鐘 60 次額度）：查價、漲跌停與可否現沖用 get_quotes；大盤背景用 get_market_overview；開盤後走勢與量能用 get_intraday_candles；近 N 日量價、振幅、均線用 get_daily_history。證交所 OpenAPI（前一交易日盤後資料，僅上市股票，不吃富果額度）：當沖前先用 get_daytrade_status 確認可否當沖、是否注意／處置；個股融資融券用 get_margin_trading；估值用 get_valuation；全部注意／處置股用 get_alert_lists。籌碼面（免費官方資料，上市上櫃皆可）：個股三大法人買賣超與連買天數用 get_institutional_trades；全市場法人買賣超排行用 get_institutional_ranking；千張大戶持股與週增減用 get_major_holders。注意時段：開盤前或休市日，盤中工具回傳的是最近一個交易日資料，請看 isToday／date。盤中監控：set_daytrade_watchlist 寫入當日當沖條件後，伺服器每數秒自動檢查並以 Telegram 通知（含進場後的停損、第一目標與保本通知）；get_daytrade_watchlist 查看狀態；做空當沖在該檔設 side:\"short\" 並用 priceBelow／invalidAbove。週選股推播：announce_weekly_picks（新推薦、每日檢查觸發、週五週報）。所有工具的個股成交量單位一律為「張」，成交金額為「元」；所有時間為台北時間。",
+          "台股行情。富果 API（上市上櫃皆可，每分鐘 60 次額度）：查價、漲跌停與可否現沖用 get_quotes；大盤背景用 get_market_overview；開盤後走勢與量能用 get_intraday_candles；近 N 日量價、振幅、均線用 get_daily_history。證交所 OpenAPI（前一交易日盤後資料，僅上市股票，不吃富果額度）：當沖前先用 get_daytrade_status 確認可否當沖、是否注意／處置；個股融資融券用 get_margin_trading；估值用 get_valuation；全部注意／處置股用 get_alert_lists。籌碼面（免費官方資料，上市上櫃皆可）：個股三大法人買賣超與連買天數用 get_institutional_trades；全市場法人買賣超排行用 get_institutional_ranking；千張大戶持股與週增減用 get_major_holders。注意時段：開盤前或休市日，盤中工具回傳的是最近一個交易日資料，請看 isToday／date。盤中監控：set_daytrade_watchlist 寫入當日當沖條件後，伺服器每數秒自動檢查並以 Telegram 通知（含進場後的停損、第一目標與保本通知）；get_daytrade_watchlist 查看狀態；做空當沖在該檔設 side:\"short\" 並用 priceBelow／invalidAbove。波段盤中通知：set_swing_alerts 寫入持股停損／目標與候選股進場價位（約每 60 秒檢查，價位到了才用 Telegram 通知，持股只送私訊），get_swing_alerts 查看狀態。週選股推播：announce_weekly_picks（新推薦、每日檢查觸發、週五週報）。所有工具的個股成交量單位一律為「張」，成交金額為「元」；所有時間為台北時間。",
       });
     }
     case "ping":
