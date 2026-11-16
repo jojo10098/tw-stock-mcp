@@ -23,7 +23,7 @@ import { getInstitutionalTrades, getInstitutionalRanking, getMajorHolders } from
 export { WatchMonitor };
 setMonitorDeps({ getQuotes, getDailyHistory, getMinuteHistory });
 
-const SERVER_INFO = { name: "tw-stock-mcp", version: "0.9.0" };
+const SERVER_INFO = { name: "tw-stock-mcp", version: "0.9.1" };
 const SUPPORTED_PROTOCOLS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
 const INDEX_SYMBOLS = {
@@ -324,11 +324,11 @@ const TOOLS = [
   {
     name: "announce_weekly_picks",
     description:
-      "【週選股推播】把週選股的內容推播到 Telegram（與當沖清單同樣的收件者，可能包含公開頻道，所以不要放部位金額、股數、成本等個人資訊）。kind 三選一：new_picks＝星期一新推薦（picks：代號、名稱、tier、thesisType、基準價、進場區間、停損、目標、horizon、settleBy、看多理由、風險、看錯條件）；daily_alerts＝每日檢查有觸發時（alerts：type 為 entry／stop／target／invalidated／nearStop，附前一日收盤與一句說明；停損或目標提前結算時附 settlement）；weekly_review＝星期五進度與結算（items：進行中的 thesisStatus、距結算幾週，已結算的 verdict、照計畫報酬；record：累計戰績；strategyNote：策略維持／更新／待確認提案）。伺服器會檢查停損低於進場區間、目標高於進場區間。",
+      "【週選股推播】把週選股的內容推播到 Telegram（與當沖清單同樣的收件者，可能包含公開頻道，所以不要放部位金額、股數、成本等個人資訊）。kind 四選一：new_picks＝星期一新推薦（picks：代號、名稱、tier、thesisType、基準價、進場區間、停損、目標、horizon、settleBy、看多理由、風險、看錯條件）；daily_alerts＝每日檢查有觸發時（alerts：type 為 entry／stop／target／invalidated／nearStop，附前一日收盤與一句說明；停損或目標提前結算時附 settlement）；daily_status＝每個交易日的進度，不論有無觸發（items：代號、名稱、lastPrice、changePct、pctFromRef、entryFilled、toStopPct 距停損 %、toTargetPct 距目標 %、foreignStreak／trustStreak 連續買賣超天數、thesisStatus、settleBy、note）；weekly_review＝星期五進度與結算（items：進行中的 thesisStatus、距結算幾週，已結算的 verdict、照計畫報酬；record：累計戰績；strategyNote：策略維持／更新／待確認提案）。伺服器會檢查停損低於進場區間、目標高於進場區間。",
     inputSchema: {
       type: "object",
       properties: {
-        kind: { type: "string", enum: ["new_picks", "daily_alerts", "weekly_review"] },
+        kind: { type: "string", enum: ["new_picks", "daily_alerts", "daily_status", "weekly_review"] },
         date: { type: "string", description: "台北日期 YYYY-MM-DD" },
         week: { type: "string", description: "例如 2026-W46" },
         strategyVersion: { type: "integer", description: "本週適用的策略版本號" },
@@ -396,8 +396,15 @@ const TOOLS = [
               planPnlPct: { type: "number" },
               early: { type: "boolean" },
               note: { type: "string" },
+              changePct: { type: "number", description: "daily_status：前一交易日漲跌 %" },
+              entryFilled: { type: "boolean", description: "daily_status：是否已進場" },
+              toStopPct: { type: "number", description: "daily_status：停損相對收盤 %（負數）" },
+              toTargetPct: { type: "number", description: "daily_status：目標相對收盤 %" },
+              foreignStreak: { type: "integer", description: "daily_status：外資連續買賣超天數（+買／-賣）" },
+              trustStreak: { type: "integer", description: "daily_status：投信連續買賣超天數（+買／-賣）" },
+              settleBy: { type: "string", description: "daily_status：結算日 YYYY-MM-DD" },
             },
-            required: ["code", "status"],
+            required: ["code"],
           },
         },
         record: {
@@ -1108,7 +1115,7 @@ async function handleRpc(env, msg) {
         capabilities: { tools: { listChanged: false } },
         serverInfo: SERVER_INFO,
         instructions:
-          "台股行情。富果 API（上市上櫃皆可，每分鐘 60 次額度）：查價、漲跌停與可否現沖用 get_quotes；大盤背景用 get_market_overview；開盤後走勢與量能用 get_intraday_candles；近 N 日量價、振幅、均線用 get_daily_history。證交所 OpenAPI（前一交易日盤後資料，僅上市股票，不吃富果額度）：當沖前先用 get_daytrade_status 確認可否當沖、是否注意／處置；個股融資融券用 get_margin_trading；估值用 get_valuation；全部注意／處置股用 get_alert_lists。籌碼面（免費官方資料，上市上櫃皆可）：個股三大法人買賣超與連買天數用 get_institutional_trades；全市場法人買賣超排行用 get_institutional_ranking；千張大戶持股與週增減用 get_major_holders。注意時段：開盤前或休市日，盤中工具回傳的是最近一個交易日資料，請看 isToday／date。盤中監控：set_daytrade_watchlist 寫入當日當沖條件後，伺服器每數秒自動檢查並以 Telegram 通知（含進場後的停損、第一目標與保本通知）；get_daytrade_watchlist 查看狀態；做空當沖在該檔設 side:\"short\" 並用 priceBelow／invalidAbove。波段盤中通知：set_swing_alerts 寫入持股停損／目標與候選股進場價位（約每 60 秒檢查，價位到了才用 Telegram 通知，持股只送私訊），get_swing_alerts 查看狀態。週選股推播：announce_weekly_picks（新推薦、每日檢查觸發、週五週報）。所有工具的個股成交量單位一律為「張」，成交金額為「元」；所有時間為台北時間。",
+          "台股行情。富果 API（上市上櫃皆可，每分鐘 60 次額度）：查價、漲跌停與可否現沖用 get_quotes；大盤背景用 get_market_overview；開盤後走勢與量能用 get_intraday_candles；近 N 日量價、振幅、均線用 get_daily_history。證交所 OpenAPI（前一交易日盤後資料，僅上市股票，不吃富果額度）：當沖前先用 get_daytrade_status 確認可否當沖、是否注意／處置；個股融資融券用 get_margin_trading；估值用 get_valuation；全部注意／處置股用 get_alert_lists。籌碼面（免費官方資料，上市上櫃皆可）：個股三大法人買賣超與連買天數用 get_institutional_trades；全市場法人買賣超排行用 get_institutional_ranking；千張大戶持股與週增減用 get_major_holders。注意時段：開盤前或休市日，盤中工具回傳的是最近一個交易日資料，請看 isToday／date。盤中監控：set_daytrade_watchlist 寫入當日當沖條件後，伺服器每數秒自動檢查並以 Telegram 通知（含進場後的停損、第一目標與保本通知）；get_daytrade_watchlist 查看狀態；做空當沖在該檔設 side:\"short\" 並用 priceBelow／invalidAbove。波段盤中通知：set_swing_alerts 寫入持股停損／目標與候選股進場價位（約每 60 秒檢查，價位到了才用 Telegram 通知，持股只送私訊），get_swing_alerts 查看狀態。週選股推播：announce_weekly_picks（新推薦、每日檢查觸發、每日進度、週五週報）。所有工具的個股成交量單位一律為「張」，成交金額為「元」；所有時間為台北時間。",
       });
     }
     case "ping":

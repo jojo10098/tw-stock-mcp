@@ -4,6 +4,7 @@
  * 晨報用 MCP 工具 announce_weekly_picks 送出三種訊息：
  *   new_picks     星期一的新推薦（含完整進出場計畫）
  *   daily_alerts  每日檢查有觸發時（進場、停損、目標、看錯條件、接近停損）
+ *   daily_status  每個交易日的進度（收盤、距停損／目標、法人連買賣），不論有沒有觸發
  *   weekly_review 星期五的進度、結算與累計戰績
  *
  * 推播會送到 TELEGRAM_CHAT_ID 的所有收件者（可能包含公開頻道），
@@ -66,8 +67,8 @@ const THESIS = ["成立中", "動搖", "被推翻"];
 
 export function validatePicksMessage(input) {
   const kind = input?.kind;
-  if (!["new_picks", "daily_alerts", "weekly_review"].includes(kind)) {
-    throw new Error("kind 只能是 new_picks／daily_alerts／weekly_review");
+  if (!["new_picks", "daily_alerts", "daily_status", "weekly_review"].includes(kind)) {
+    throw new Error("kind 只能是 new_picks／daily_alerts／daily_status／weekly_review");
   }
   const date = String(input?.date ?? "");
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error("date 必須是 YYYY-MM-DD（台北日期）");
@@ -128,6 +129,32 @@ export function validatePicksMessage(input) {
               planPnlPct: numOrNull(s.planPnlPct, `${f}.settlement.planPnlPct`),
             }
           : null,
+      };
+    });
+  }
+
+  if (kind === "daily_status") {
+    const items = Array.isArray(input?.items) ? input.items : [];
+    if (!items.length) throw new Error("daily_status 至少要有一檔 items（全部結算後就不需要推播）");
+    base.items = items.slice(0, 10).map((x, i) => {
+      const f = `items[${i}]`;
+      const settleBy = str(x?.settleBy, 10, `${f}.settleBy`);
+      if (settleBy && !/^\d{4}-\d{2}-\d{2}$/.test(settleBy)) throw new Error(`${f}.settleBy 必須是 YYYY-MM-DD`);
+      const streak = (v) => (v == null || v === "" ? null : parseInt(v, 10) || 0);
+      return {
+        code: code(x?.code, `${f}.code`),
+        name: str(x?.name, 20, `${f}.name`),
+        lastPrice: pos(x?.lastPrice, `${f}.lastPrice`),
+        changePct: numOrNull(x?.changePct, `${f}.changePct`),
+        pctFromRef: numOrNull(x?.pctFromRef, `${f}.pctFromRef`),
+        entryFilled: x?.entryFilled === true ? true : x?.entryFilled === false ? false : null,
+        toStopPct: numOrNull(x?.toStopPct, `${f}.toStopPct`),
+        toTargetPct: numOrNull(x?.toTargetPct, `${f}.toTargetPct`),
+        foreignStreak: streak(x?.foreignStreak),
+        trustStreak: streak(x?.trustStreak),
+        thesisStatus: THESIS.includes(x?.thesisStatus) ? x.thesisStatus : null,
+        settleBy,
+        note: str(x?.note, 160, `${f}.note`),
       };
     });
   }
@@ -210,6 +237,31 @@ export function formatPicksMessage(m) {
       if (settled) lines.push(settled.slice(1));
     }
     lines.push("", "⚠️ 這是週選股計畫的條件通知，不是買賣建議。");
+    return cut(lines.join("\n"));
+  }
+
+  if (m.kind === "daily_status") {
+    const streakTxt = (label, n) => (n == null ? null : n === 0 ? `${label}無連續` : `${label}連 ${Math.abs(n)} ${n > 0 ? "買" : "賣"}`);
+    lines.push(`📋 ${md} 週選股每日進度`);
+    if (m.note) lines.push(m.note);
+    for (const x of m.items) {
+      const head = [
+        x.lastPrice != null ? `收 ${fmt(x.lastPrice)}${x.changePct != null ? `（${pctTxt(x.changePct)}）` : ""}` : null,
+        x.entryFilled == null ? null : x.entryFilled ? "已進場" : "未進場",
+        x.thesisStatus ? `理由${x.thesisStatus}` : null,
+      ].filter(Boolean).join("｜");
+      lines.push("", `• ${x.code} ${x.name}`.trim() + (head ? `｜${head}` : ""));
+      const dist = [
+        x.toStopPct != null ? `距停損 ${pctTxt(x.toStopPct)}` : null,
+        x.toTargetPct != null ? `距目標 ${pctTxt(x.toTargetPct)}` : null,
+        x.pctFromRef != null ? `相對基準 ${pctTxt(x.pctFromRef)}` : null,
+      ].filter(Boolean).join("｜");
+      if (dist) lines.push(`  ${dist}`);
+      const chips = [streakTxt("外資", x.foreignStreak), streakTxt("投信", x.trustStreak), x.settleBy ? `${mdOf(x.settleBy)}結算` : null].filter(Boolean).join("｜");
+      if (chips) lines.push(`  ${chips}`);
+      if (x.note) lines.push(`  ${x.note}`);
+    }
+    lines.push("", "⚠️ 這是週選股計畫的每日追蹤，不是買賣建議。");
     return cut(lines.join("\n"));
   }
 

@@ -551,6 +551,12 @@ Date.now = realNow;
     { code: "1101", name: "台泥", status: "settled", verdict: "失敗", planPnlPct: -8.33, early: true },
   ], record: { success: 0, partial: 0, fail: 5, noEntry: 1, avgPnlPct: -9.93, enteredCount: 5 }, strategyNote: "維持 v3 不變（本週僅累積觀察）" }));
   check("週報推播內容", t3.startsWith("📊 11/13（五） 週選股週報｜策略 v3") && t3.includes("2412 中華電｜收 162｜相對基準 -0.92%｜理由成立中｜距結算 3 週") && t3.includes("1101 台泥｜失敗｜照計畫 -8.33%（提前結算）") && t3.includes("累計戰績：成立 0、部分成立 0、失敗 5、未進場 1；有進場平均 -9.93%（5 檔）") && t3.includes("樣本數仍小") && t3.includes("策略：維持 v3"));
+  check("週選股：daily_status 沒有 items → 錯誤", throws(() => validatePicksMessage({ kind: "daily_status", date: "2026-11-17", items: [] })));
+  const t4 = formatPicksMessage(validatePicksMessage({ kind: "daily_status", date: "2026-11-17", note: "大盤 -6.03%", items: [
+    { code: "1101", name: "台泥", lastPrice: 26.45, changePct: -3.29, pctFromRef: -5.37, entryFilled: true, toStopPct: -5.86, toTargetPct: 13.42, foreignStreak: 1, trustStreak: 0, thesisStatus: "成立中", settleBy: "2026-11-20" },
+    { code: "2412", name: "中華電", lastPrice: 163.5, changePct: -0.91, entryFilled: true, toStopPct: -10.7, toTargetPct: 7.65, foreignStreak: 5, trustStreak: -2, settleBy: "2026-12-04", note: "盤中高 168" },
+  ] }));
+  check("每日進度推播內容", t4.startsWith("📋 11/17（二） 週選股每日進度") && t4.includes("• 1101 台泥｜收 26.45（-3.29%）｜已進場｜理由成立中") && t4.includes("距停損 -5.86%｜距目標 +13.42%｜相對基準 -5.37%") && t4.includes("外資連 1 買｜投信無連續｜11/20（五）結算") && t4.includes("外資連 5 買｜投信連 2 賣｜12/4（五）結算") && t4.includes("  盤中高 168"));
   const before = sent.length;
   const res = await (await worker.fetch(new Request(`https://x.dev/mcp/${TOKEN}`, { method: "POST", body: JSON.stringify({
     jsonrpc: "2.0", id: 30, method: "tools/call", params: { name: "announce_weekly_picks", arguments: { kind: "new_picks", date: "2026-11-09", picks: [pick] } } }) }), env)).json();
