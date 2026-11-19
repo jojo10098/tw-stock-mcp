@@ -199,106 +199,117 @@ function cut(text) {
   return text.length > 4000 ? text.slice(0, 3990) + "\n…（過長截斷）" : text; // Telegram 單則上限 4096 字
 }
 
+// 手機上一行約 18–22 個全形字，太長會在 Telegram 擠成一大塊。
+// 晨報傳來的 note 常用「；」或「，」串很多事，這裡拆成一行一件。
+const SEP = "━━━━━━━━━━";
+function noteLines(note, bullet = "· ") {
+  if (!note) return [];
+  return String(note)
+    .split(/[；;。\n]+/)
+    .map((t) => t.trim())
+    .filter(Boolean)
+    .map((t) => bullet + t);
+}
+const streakTxt = (label, n) => (n == null ? null : n === 0 ? `${label}無連續` : `${label}連 ${Math.abs(n)} ${n > 0 ? "買" : "賣"}`);
+const join = (arr, sep = "　") => arr.filter(Boolean).join(sep);
+
 export function formatPicksMessage(m) {
   const md = mdOf(m.date);
-  const ver = m.strategyVersion ? `｜策略 v${m.strategyVersion}` : "";
+  const ver = m.strategyVersion ? `（策略 v${m.strategyVersion}）` : "";
   const lines = [];
+  const block = (...rows) => lines.push("", SEP, ...rows.flat().filter((r) => r != null && r !== ""));
 
   if (m.kind === "new_picks") {
-    lines.push(`📈 ${md} 本週選股${m.week ? `（${m.week}）` : ""}${ver}`);
-    if (m.note) lines.push(m.note);
+    lines.push(`📈 ${md} 本週選股${m.week ? ` ${m.week}` : ""}${ver}`);
+    lines.push(...noteLines(m.note));
     m.picks.forEach((p, i) => {
       const mid = (p.entryLow + p.entryHigh) / 2;
       const stopPct = ((p.stop / mid - 1) * 100).toFixed(1);
       const tgtPct = ((p.target / mid - 1) * 100).toFixed(1);
-      const tags = [TIER[p.tier], p.thesisType].filter(Boolean).join("｜");
-      lines.push("", `${i + 1}) ${p.code} ${p.name}`.trim() + (tags ? `｜${tags}` : ""));
-      lines.push(`  基準價 ${fmt(p.refPrice)}｜進場 ${fmt(p.entryLow)}–${fmt(p.entryHigh)}`);
-      lines.push(`  停損 ${fmt(p.stop)}（收盤跌破，距進場中值 ${stopPct}%）｜目標 ${fmt(p.target)}（+${tgtPct}%）`);
-      const hz = [p.horizon ? `持有 ${p.horizon}` : null, p.settleBy ? `${mdOf(p.settleBy)}結算` : null].filter(Boolean).join("，");
-      if (hz) lines.push(`  ${hz}`);
-      if (p.thesis.length) lines.push("  看多理由：", ...p.thesis.map((t) => `  • ${t}`));
-      if (p.risks.length) lines.push("  風險：", ...p.risks.map((t) => `  • ${t}`));
-      if (p.invalidatedIf) lines.push(`  看錯條件：${p.invalidatedIf}`);
+      const tags = join([TIER[p.tier], p.thesisType], "・");
+      block(
+        `${i + 1}) ${p.code} ${p.name}`.trim(),
+        tags || null,
+        `基準價 ${fmt(p.refPrice)}`,
+        `進場 ${fmt(p.entryLow)}–${fmt(p.entryHigh)}`,
+        `停損 ${fmt(p.stop)}（${stopPct}%，收盤跌破）`,
+        `目標 ${fmt(p.target)}（+${tgtPct}%）`,
+        join([p.horizon ? `持有 ${p.horizon}` : null, p.settleBy ? `${mdOf(p.settleBy)}結算` : null]) || null,
+        p.thesis.length ? ["", "看多理由", ...p.thesis.map((t) => `· ${t}`)] : [],
+        p.risks.length ? ["", "風險", ...p.risks.map((t) => `· ${t}`)] : [],
+        p.invalidatedIf ? ["", "看錯條件", `· ${p.invalidatedIf}`] : [],
+      );
     });
-    lines.push("", "之後每個交易日檢查，觸發進場、停損、目標或看錯條件時會再通知。", "⚠️ 這是 2–6 週的波段計畫，不是買賣建議。");
+    lines.push("", "之後每個交易日檢查，觸發時會再通知。", "⚠️ 2–6 週的波段計畫，不是買賣建議。");
     return cut(lines.join("\n"));
   }
 
   if (m.kind === "daily_alerts") {
-    lines.push(`🔔 ${md} 週選股每日檢查`);
-    if (m.note) lines.push(m.note);
+    lines.push(`🔔 ${md} 週選股觸發通知`);
+    lines.push(...noteLines(m.note));
     for (const a of m.alerts) {
       const settled = a.settlement
-        ? `\n  已提前結算：${a.settlement.verdict ?? "—"}${a.settlement.planPnlPct != null ? `，照計畫 ${pctTxt(a.settlement.planPnlPct)}` : "（未進場）"}`
-        : "";
-      lines.push("", `${ALERT[a.type]}｜${a.code} ${a.name}`.trim() + (a.close != null ? `｜收 ${fmt(a.close)}` : ""));
-      if (a.note) lines.push(`  ${a.note}`);
-      if (settled) lines.push(settled.slice(1));
+        ? `已提前結算：${a.settlement.verdict ?? "—"}${a.settlement.planPnlPct != null ? `，照計畫 ${pctTxt(a.settlement.planPnlPct)}` : "（未進場）"}`
+        : null;
+      block(ALERT[a.type], `${a.code} ${a.name}`.trim(), a.close != null ? `收盤 ${fmt(a.close)}` : null, noteLines(a.note), settled);
     }
-    lines.push("", "⚠️ 這是週選股計畫的條件通知，不是買賣建議。");
+    lines.push("", "⚠️ 週選股計畫的條件通知，不是買賣建議。");
     return cut(lines.join("\n"));
   }
 
   if (m.kind === "daily_status") {
-    const streakTxt = (label, n) => (n == null ? null : n === 0 ? `${label}無連續` : `${label}連 ${Math.abs(n)} ${n > 0 ? "買" : "賣"}`);
     lines.push(`📋 ${md} 週選股每日進度`);
-    if (m.note) lines.push(m.note);
+    lines.push(...noteLines(m.note));
     for (const x of m.items) {
-      const head = [
-        x.lastPrice != null ? `收 ${fmt(x.lastPrice)}${x.changePct != null ? `（${pctTxt(x.changePct)}）` : ""}` : null,
-        x.entryFilled == null ? null : x.entryFilled ? "已進場" : "未進場",
-        x.thesisStatus ? `理由${x.thesisStatus}` : null,
-      ].filter(Boolean).join("｜");
-      lines.push("", `• ${x.code} ${x.name}`.trim() + (head ? `｜${head}` : ""));
-      const dist = [
-        x.toStopPct != null ? `距停損 ${pctTxt(x.toStopPct)}` : null,
-        x.toTargetPct != null ? `距目標 ${pctTxt(x.toTargetPct)}` : null,
+      block(
+        `${x.code} ${x.name}`.trim(),
+        x.lastPrice != null ? `收盤 ${fmt(x.lastPrice)}${x.changePct != null ? `（${pctTxt(x.changePct)}）` : ""}` : null,
+        join([x.entryFilled == null ? null : x.entryFilled ? "已進場" : "未進場", x.thesisStatus ? `理由${x.thesisStatus}` : null]) || null,
+        join([x.toStopPct != null ? `距停損 ${pctTxt(x.toStopPct)}` : null, x.toTargetPct != null ? `距目標 ${pctTxt(x.toTargetPct)}` : null]) || null,
         x.pctFromRef != null ? `相對基準 ${pctTxt(x.pctFromRef)}` : null,
-      ].filter(Boolean).join("｜");
-      if (dist) lines.push(`  ${dist}`);
-      const chips = [streakTxt("外資", x.foreignStreak), streakTxt("投信", x.trustStreak), x.settleBy ? `${mdOf(x.settleBy)}結算` : null].filter(Boolean).join("｜");
-      if (chips) lines.push(`  ${chips}`);
-      if (x.note) lines.push(`  ${x.note}`);
+        join([streakTxt("外資", x.foreignStreak), streakTxt("投信", x.trustStreak)]) || null,
+        x.settleBy ? `${mdOf(x.settleBy)}結算` : null,
+        noteLines(x.note),
+      );
     }
-    lines.push("", "⚠️ 這是週選股計畫的每日追蹤，不是買賣建議。");
+    lines.push("", "⚠️ 週選股計畫的每日追蹤，不是買賣建議。");
     return cut(lines.join("\n"));
   }
 
   // weekly_review
   lines.push(`📊 ${md} 週選股週報${ver}`);
-  if (m.note) lines.push(m.note);
+  lines.push(...noteLines(m.note));
   const open = m.items.filter((x) => x.status === "open");
   const settled = m.items.filter((x) => x.status === "settled");
-  if (open.length) {
-    lines.push("", "進行中");
-    for (const x of open) {
-      const bits = [
-        x.lastPrice != null ? `收 ${fmt(x.lastPrice)}` : null,
-        x.pctFromRef != null ? `相對基準 ${pctTxt(x.pctFromRef)}` : null,
-        x.thesisStatus ? `理由${x.thesisStatus}` : null,
-        x.weeksLeft != null ? (x.weeksLeft === 0 ? "本週結算" : `距結算 ${x.weeksLeft} 週`) : null,
-      ].filter(Boolean).join("｜");
-      lines.push(`• ${x.code} ${x.name}`.trim() + (bits ? `｜${bits}` : ""));
-      if (x.note) lines.push(`  ${x.note}`);
-    }
+  for (const x of open) {
+    block(
+      `▶️ 進行中｜${x.code} ${x.name}`.trim(),
+      x.lastPrice != null ? `收盤 ${fmt(x.lastPrice)}` : null,
+      x.pctFromRef != null ? `相對基準 ${pctTxt(x.pctFromRef)}` : null,
+      join([x.thesisStatus ? `理由${x.thesisStatus}` : null, x.weeksLeft != null ? (x.weeksLeft === 0 ? "本週結算" : `距結算 ${x.weeksLeft} 週`) : null]) || null,
+      noteLines(x.note),
+    );
   }
-  if (settled.length) {
-    lines.push("", "已結算");
-    for (const x of settled) {
-      const pnl = x.planPnlPct != null ? `照計畫 ${pctTxt(x.planPnlPct)}` : "未進場";
-      lines.push(`• ${x.code} ${x.name}`.trim() + `｜${x.verdict ?? "—"}｜${pnl}${x.early ? "（提前結算）" : ""}`);
-      if (x.note) lines.push(`  ${x.note}`);
-    }
+  for (const x of settled) {
+    block(
+      `🏁 已結算｜${x.code} ${x.name}`.trim(),
+      `${x.verdict ?? "—"}${x.early ? "（提前結算）" : ""}`,
+      x.planPnlPct != null ? `照計畫 ${pctTxt(x.planPnlPct)}` : "未進場",
+      noteLines(x.note),
+    );
   }
   if (m.record) {
     const r = m.record;
-    const avg = r.avgPnlPct != null ? `；有進場平均 ${pctTxt(r.avgPnlPct)}${r.enteredCount != null ? `（${r.enteredCount} 檔）` : ""}` : "";
     const total = r.success + r.partial + r.fail + r.noEntry;
-    lines.push("", `累計戰績：成立 ${r.success}、部分成立 ${r.partial}、失敗 ${r.fail}、未進場 ${r.noEntry}${avg}`);
-    if (total < 10) lines.push("（樣本數仍小，不足以下結論）");
+    block(
+      "累計戰績",
+      `成立 ${r.success}　部分成立 ${r.partial}`,
+      `失敗 ${r.fail}　未進場 ${r.noEntry}`,
+      r.avgPnlPct != null ? `有進場平均 ${pctTxt(r.avgPnlPct)}${r.enteredCount != null ? `（${r.enteredCount} 檔）` : ""}` : null,
+      total < 10 ? "（樣本數仍小，不足以下結論）" : null,
+    );
   }
-  if (m.strategyNote) lines.push("", `策略：${m.strategyNote}`);
-  lines.push("", "⚠️ 這是週選股計畫的檢討紀錄，不是買賣建議。");
+  if (m.strategyNote) block("策略", ...noteLines(m.strategyNote));
+  lines.push("", "⚠️ 週選股計畫的檢討紀錄，不是買賣建議。");
   return cut(lines.join("\n"));
 }

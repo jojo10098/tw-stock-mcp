@@ -538,25 +538,28 @@ Date.now = realNow;
   check("週選股：目標不高於進場區間 → 錯誤", throws(() => validatePicksMessage({ kind: "new_picks", date: "2026-11-09", picks: [{ ...pick, target: 160 }] })));
   check("週選股：daily_alerts 沒有觸發 → 錯誤", throws(() => validatePicksMessage({ kind: "daily_alerts", date: "2026-11-09", alerts: [] })));
   const t1 = formatPicksMessage(validatePicksMessage({ kind: "new_picks", date: "2026-11-09", week: "2026-W46", strategyVersion: 3, note: "市場濾網成立，本週只選一檔中大型", picks: [{ ...pick, shares: 155, sizeNote: "25,000 元" }] }));
-  check("新推薦推播內容", t1.startsWith("📈 11/9（一） 本週選股（2026-W46）｜策略 v3") && t1.includes("2412 中華電｜中大型｜獲利驅動") && t1.includes("進場 158–161.5") && t1.includes("停損 146（收盤跌破，距進場中值 -8.6%）") && t1.includes("目標 176（+10.2%）") && t1.includes("12/4（五）結算") && t1.includes("看錯條件：收盤跌破 146"));
+  check("新推薦推播內容", t1.startsWith("📈 11/9（一） 本週選股 2026-W46（策略 v3）") && t1.includes("1) 2412 中華電\n中大型・獲利驅動") && t1.includes("進場 158–161.5") && t1.includes("停損 146（-8.6%，收盤跌破）") && t1.includes("目標 176（+10.2%）") && t1.includes("12/4（五）結算") && t1.includes("看錯條件\n· 收盤跌破 146"));
   check("新推薦不含部位等個人資訊", !t1.includes("155") && !t1.includes("25,000"));
   console.log("---- 週選股推播預覽 ----\n" + t1 + "\n------------------");
   const t2 = formatPicksMessage(validatePicksMessage({ kind: "daily_alerts", date: "2026-11-10", alerts: [
     { code: "2412", name: "中華電", type: "entry", close: 160, note: "最低 158.5 首次進入進場區間" },
     { code: "1101", name: "台泥", type: "stop", close: 24.8, note: "收盤跌破停損 24.9", settlement: { verdict: "失敗", planPnlPct: -8.33 } },
   ] }));
-  check("每日檢查推播內容", t2.startsWith("🔔 11/10（二） 週選股每日檢查") && t2.includes("✅ 進入進場區間｜2412 中華電｜收 160") && t2.includes("🔴 跌破停損｜1101 台泥") && t2.includes("已提前結算：失敗，照計畫 -8.33%"));
+  check("每日檢查推播內容", t2.startsWith("🔔 11/10（二） 週選股觸發通知") && t2.includes("✅ 進入進場區間\n2412 中華電\n收盤 160") && t2.includes("🔴 跌破停損\n1101 台泥") && t2.includes("已提前結算：失敗，照計畫 -8.33%"));
   const t3 = formatPicksMessage(validatePicksMessage({ kind: "weekly_review", date: "2026-11-13", strategyVersion: 3, items: [
     { code: "2412", name: "中華電", status: "open", lastPrice: 162, pctFromRef: -0.92, thesisStatus: "成立中", weeksLeft: 3, note: "10 月營收年增 18%" },
     { code: "1101", name: "台泥", status: "settled", verdict: "失敗", planPnlPct: -8.33, early: true },
   ], record: { success: 0, partial: 0, fail: 5, noEntry: 1, avgPnlPct: -9.93, enteredCount: 5 }, strategyNote: "維持 v3 不變（本週僅累積觀察）" }));
-  check("週報推播內容", t3.startsWith("📊 11/13（五） 週選股週報｜策略 v3") && t3.includes("2412 中華電｜收 162｜相對基準 -0.92%｜理由成立中｜距結算 3 週") && t3.includes("1101 台泥｜失敗｜照計畫 -8.33%（提前結算）") && t3.includes("累計戰績：成立 0、部分成立 0、失敗 5、未進場 1；有進場平均 -9.93%（5 檔）") && t3.includes("樣本數仍小") && t3.includes("策略：維持 v3"));
+  check("週報推播內容", t3.startsWith("📊 11/13（五） 週選股週報（策略 v3）") && t3.includes("▶️ 進行中｜2412 中華電\n收盤 162\n相對基準 -0.92%\n理由成立中　距結算 3 週\n· 10 月營收年增 18%") && t3.includes("🏁 已結算｜1101 台泥\n失敗（提前結算）\n照計畫 -8.33%") && t3.includes("累計戰績\n成立 0　部分成立 0\n失敗 5　未進場 1\n有進場平均 -9.93%（5 檔）") && t3.includes("樣本數仍小") && t3.includes("策略\n· 維持 v3"));
   check("週選股：daily_status 沒有 items → 錯誤", throws(() => validatePicksMessage({ kind: "daily_status", date: "2026-11-17", items: [] })));
   const t4 = formatPicksMessage(validatePicksMessage({ kind: "daily_status", date: "2026-11-17", note: "大盤 -6.03%", items: [
     { code: "1101", name: "台泥", lastPrice: 26.45, changePct: -3.29, pctFromRef: -5.37, entryFilled: true, toStopPct: -5.86, toTargetPct: 13.42, foreignStreak: 1, trustStreak: 0, thesisStatus: "成立中", settleBy: "2026-11-20" },
     { code: "2412", name: "中華電", lastPrice: 163.5, changePct: -0.91, entryFilled: true, toStopPct: -10.7, toTargetPct: 7.65, foreignStreak: 5, trustStreak: -2, settleBy: "2026-12-04", note: "盤中高 168" },
   ] }));
-  check("每日進度推播內容", t4.startsWith("📋 11/17（二） 週選股每日進度") && t4.includes("• 1101 台泥｜收 26.45（-3.29%）｜已進場｜理由成立中") && t4.includes("距停損 -5.86%｜距目標 +13.42%｜相對基準 -5.37%") && t4.includes("外資連 1 買｜投信無連續｜11/20（五）結算") && t4.includes("外資連 5 買｜投信連 2 賣｜12/4（五）結算") && t4.includes("  盤中高 168"));
+  console.log("---- 每日進度預覽 ----\n" + t4 + "\n------------------");
+  const t5 = formatPicksMessage(validatePicksMessage({ kind: "daily_status", date: "2026-11-17", note: "大盤 -1.2%；今日無觸發", items: [{ code: "1101", name: "台泥", lastPrice: 26, note: "外資連 3 買（5 日 +3,024 張）；投信連 2 賣；營收年增 17.8%" }] }));
+  check("note 依分號拆成一行一件", t5.includes("· 大盤 -1.2%\n· 今日無觸發") && t5.includes("· 外資連 3 買（5 日 +3,024 張）\n· 投信連 2 賣\n· 營收年增 17.8%"));
+  check("每日進度推播內容", t4.startsWith("📋 11/17（二） 週選股每日進度") && t4.includes("1101 台泥\n收盤 26.45（-3.29%）\n已進場　理由成立中\n距停損 -5.86%　距目標 +13.42%\n相對基準 -5.37%\n外資連 1 買　投信無連續\n11/20（五）結算") && t4.includes("外資連 5 買　投信連 2 賣\n12/4（五）結算\n· 盤中高 168"));
   const before = sent.length;
   const res = await (await worker.fetch(new Request(`https://x.dev/mcp/${TOKEN}`, { method: "POST", body: JSON.stringify({
     jsonrpc: "2.0", id: 30, method: "tools/call", params: { name: "announce_weekly_picks", arguments: { kind: "new_picks", date: "2026-11-09", picks: [pick] } } }) }), env)).json();
