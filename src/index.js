@@ -16,6 +16,7 @@ const FUGLE_BASE = "https://api.fugle.tw/marketdata/v1.0/stock";
 const TWSE_BASE = "https://openapi.twse.com.tw/v1";
 const TWSE_CACHE_SECONDS = 600; // 證交所資料一天更新一次，快取 10 分鐘足夠
 import { scanSwing } from "./scan.js";
+import { validateEventsMessage, formatEventsMessage } from "./events.js";
 import { validateSwingList, swingStatus } from "./swing.js";
 import { WatchMonitor, validateWatchlist, kvGet, kvPut, formatWatchlistAnnouncement, runMonitorTick, watchStatus, armMonitor, setMonitorDeps, sendTelegram, taipeiParts, telegramChatIds } from "./monitor.js";
 import { validatePicksMessage, formatPicksMessage } from "./picks.js";
@@ -24,7 +25,7 @@ import { getInstitutionalTrades, getInstitutionalRanking, getMajorHolders } from
 export { WatchMonitor };
 setMonitorDeps({ getQuotes, getDailyHistory, getMinuteHistory });
 
-const SERVER_INFO = { name: "tw-stock-mcp", version: "0.10.0" };
+const SERVER_INFO = { name: "tw-stock-mcp", version: "0.11.0" };
 const SUPPORTED_PROTOCOLS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
 const INDEX_SYMBOLS = {
@@ -116,6 +117,39 @@ const TOOLS = [
         holdings: { type: "array", items: { type: "string" }, description: "持股代號，會在 setups 標示 holding（持股不新開倉）" },
       },
       required: ["symbols"],
+    },
+  },
+  {
+    name: "announce_market_events",
+    description:
+      "【重大事件推播】把今天或本週的重大事件（國際峰會與元首會談、央行會議、美國重要經濟數據、關稅與晶片出口管制、兩岸與地緣政治、重要財報與法說）推播到 Telegram。預設送全部收件者（可能包含公開頻道），所以不要放部位、股數、成本或金額（伺服器會擋）；privateOnly=true 只送個人私訊。每筆 event：title（必填）、date（YYYY-MM-DD，不是今天才需要）、when（台北時間，例「下午」「21:30」）、impact（high／medium／low）、topics（議題）、detail（用「；」分隔多件事，會自動拆行）、watch（可能影響的族群或要留意的地方，不預測結果）、source。頂層 headline 一句總結、note 補充。沒有事件就不要呼叫。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        date: { type: "string", description: "台北日期 YYYY-MM-DD" },
+        headline: { type: "string", description: "一句總結，例「今天下午川習普會，留意台海與關稅議題」" },
+        events: {
+          type: "array",
+          maxItems: 8,
+          items: {
+            type: "object",
+            properties: {
+              title: { type: "string" },
+              date: { type: "string" },
+              when: { type: "string" },
+              impact: { type: "string", enum: ["high", "medium", "low"] },
+              topics: { type: "array", items: { type: "string" } },
+              detail: { type: "string" },
+              watch: { type: "string" },
+              source: { type: "string" },
+            },
+            required: ["title"],
+          },
+        },
+        note: { type: "string" },
+        privateOnly: { type: "boolean", description: "只送個人私訊，預設 false（送全部收件者）" },
+      },
+      required: ["date", "events"],
     },
   },
   {
@@ -1076,6 +1110,17 @@ async function announceWeeklyPicks(env, args) {
   };
 }
 
+async function announceMarketEvents(env, args) {
+  const msg = validateEventsMessage(args);
+  const text = formatEventsMessage(msg);
+  const r = await sendTelegram(env, text, { privateOnly: msg.privateOnly });
+  return {
+    ok: r.ok,
+    announced: r.ok ? `已推播到 ${r.sentTo} 個收件者${msg.privateOnly ? "（只送私訊）" : ""}` : `推播失敗：${r.reason}`,
+    preview: text,
+  };
+}
+
 async function getDaytradeWatchlist(env) {
   if (!env.MONITOR) throw new Error("伺服器尚未設定 MONITOR（Durable Object）綁定");
   return watchStatus(env);
@@ -1096,6 +1141,7 @@ const HANDLERS = {
   set_swing_alerts: setSwingAlerts,
   get_swing_alerts: getSwingAlerts,
   announce_weekly_picks: announceWeeklyPicks,
+  announce_market_events: announceMarketEvents,
   get_institutional_trades: getInstitutionalTrades,
   get_institutional_ranking: getInstitutionalRanking,
   get_major_holders: (env, args) => getMajorHolders(env, args, chipStore(env)),
@@ -1134,7 +1180,7 @@ async function handleRpc(env, msg) {
         capabilities: { tools: { listChanged: false } },
         serverInfo: SERVER_INFO,
         instructions:
-          "台股行情。富果 API（上市上櫃皆可，每分鐘 60 次額度）：查價、漲跌停與可否現沖用 get_quotes；大盤背景用 get_market_overview；開盤後走勢與量能用 get_intraday_candles；近 N 日量價、振幅、均線用 get_daily_history；波段策略的大盤濾網、股票池指標與拉回設定用 scan_swing（伺服器端計算，一次 25 檔，比逐檔抓 csv 省很多 token）。證交所 OpenAPI（前一交易日盤後資料，僅上市股票，不吃富果額度）：當沖前先用 get_daytrade_status 確認可否當沖、是否注意／處置；個股融資融券用 get_margin_trading；估值用 get_valuation；全部注意／處置股用 get_alert_lists。籌碼面（免費官方資料，上市上櫃皆可）：個股三大法人買賣超與連買天數用 get_institutional_trades；全市場法人買賣超排行用 get_institutional_ranking；千張大戶持股與週增減用 get_major_holders。注意時段：開盤前或休市日，盤中工具回傳的是最近一個交易日資料，請看 isToday／date。盤中監控：set_daytrade_watchlist 寫入當日當沖條件後，伺服器每數秒自動檢查並以 Telegram 通知（含進場後的停損、第一目標與保本通知）；get_daytrade_watchlist 查看狀態；做空當沖在該檔設 side:\"short\" 並用 priceBelow／invalidAbove。波段盤中通知：set_swing_alerts 寫入持股停損／目標與候選股進場價位（約每 60 秒檢查，價位到了才用 Telegram 通知，持股只送私訊），get_swing_alerts 查看狀態。週選股推播：announce_weekly_picks（新推薦、每日檢查觸發、每日進度、週五週報）。所有工具的個股成交量單位一律為「張」，成交金額為「元」；所有時間為台北時間。",
+          "台股行情。富果 API（上市上櫃皆可，每分鐘 60 次額度）：查價、漲跌停與可否現沖用 get_quotes；大盤背景用 get_market_overview；開盤後走勢與量能用 get_intraday_candles；近 N 日量價、振幅、均線用 get_daily_history；波段策略的大盤濾網、股票池指標與拉回設定用 scan_swing（伺服器端計算，一次 25 檔，比逐檔抓 csv 省很多 token）。證交所 OpenAPI（前一交易日盤後資料，僅上市股票，不吃富果額度）：當沖前先用 get_daytrade_status 確認可否當沖、是否注意／處置；個股融資融券用 get_margin_trading；估值用 get_valuation；全部注意／處置股用 get_alert_lists。籌碼面（免費官方資料，上市上櫃皆可）：個股三大法人買賣超與連買天數用 get_institutional_trades；全市場法人買賣超排行用 get_institutional_ranking；千張大戶持股與週增減用 get_major_holders。注意時段：開盤前或休市日，盤中工具回傳的是最近一個交易日資料，請看 isToday／date。盤中監控：set_daytrade_watchlist 寫入當日當沖條件後，伺服器每數秒自動檢查並以 Telegram 通知（含進場後的停損、第一目標與保本通知）；get_daytrade_watchlist 查看狀態；做空當沖在該檔設 side:\"short\" 並用 priceBelow／invalidAbove。波段盤中通知：set_swing_alerts 寫入持股停損／目標與候選股進場價位（約每 60 秒檢查，價位到了才用 Telegram 通知，持股只送私訊），get_swing_alerts 查看狀態。週選股推播：announce_weekly_picks（新推薦、每日檢查觸發、每日進度、週五週報）。重大事件推播：announce_market_events（峰會、央行、關稅與晶片管制、兩岸與地緣政治等，送 Telegram）。所有工具的個股成交量單位一律為「張」，成交金額為「元」；所有時間為台北時間。",
       });
     }
     case "ping":
