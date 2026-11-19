@@ -1,12 +1,12 @@
 {
   "name": "tw-stock-mcp",
-  "version": "0.9.1",
+  "version": "0.10.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "test": "node test/smoke.mjs && node test/monitor.mjs && node test/chips.mjs && node test/swing.mjs"
+    "test": "node test/smoke.mjs && node test/monitor.mjs && node test/chips.mjs && node test/swing.mjs && node test/scan.mjs"
   },
   "devDependencies": {
     "wrangler": "^4"

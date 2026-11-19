@@ -88,7 +88,7 @@ const init = await call({ jsonrpc: "2.0", id: 1, method: "initialize", params: {
 check("initialize", init.body.result?.serverInfo?.name === "tw-stock-mcp");
 check("notification → 202", (await call({ jsonrpc: "2.0", method: "notifications/initialized" })).status === 202);
 const list = await call({ jsonrpc: "2.0", id: 2, method: "tools/list" });
-check("tools/list 有 16 個工具", list.body.result.tools.length === 16);
+check("tools/list 有 17 個工具", list.body.result.tools.length === 17);
 const q = await call({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "get_quotes", arguments: { symbols: ["2330", "IX0001"] } } });
 const qd = JSON.parse(q.body.result.content[0].text);
 check("get_quotes 跳空 1%", qd.quotes[0].openGapPercent === 1);
@@ -116,6 +116,8 @@ histRanges.length = 0;
 const hc = JSON.parse((await call({ jsonrpc: "2.0", id: 51, method: "tools/call", params: { name: "get_daily_history", arguments: { symbol: "2330", days: 250, format: "csv" } } })).body.result.content[0].text);
 check("days 250 → 分段查詢、每段不超過一年", histRanges.length === 2 && histRanges.every(([f, t]) => (Date.parse(t) - Date.parse(f)) / 86400000 <= 365));
 check("csv 舊到新、去重", hc.order === "舊到新" && hc.csv.split("\n").length === 3 && hc.csv.split("\n")[1].startsWith("2026-10-16,97,99,96,98,18"));
+const sc = JSON.parse((await call({ jsonrpc: "2.0", id: 52, method: "tools/call", params: { name: "scan_swing", arguments: { symbols: ["2330"] } } })).body.result.content[0].text);
+check("scan_swing 串接：資料不足時列在 failed、不中斷", sc.counts.requested === 1 && sc.failed?.[0]?.symbol === "2330" && /不足 70 根/.test(sc.failed[0].reason) && sc.market && sc.market.ok === false);
 const ci = JSON.parse((await call({ jsonrpc: "2.0", id: 41, method: "tools/call", params: { name: "get_intraday_candles", arguments: { symbol: "IX0001" } } })).body.result.content[0].text);
 check("指數分 K 改回傳 tradeValue", ci.candles[0].tradeValue === 800 && ci.candles[0].volume === undefined);
 check("過期分 K 有 note", ci.isToday === false && /不是今天/.test(ci.note));

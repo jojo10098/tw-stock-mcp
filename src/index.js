@@ -15,6 +15,7 @@
 const FUGLE_BASE = "https://api.fugle.tw/marketdata/v1.0/stock";
 const TWSE_BASE = "https://openapi.twse.com.tw/v1";
 const TWSE_CACHE_SECONDS = 600; // 證交所資料一天更新一次，快取 10 分鐘足夠
+import { scanSwing } from "./scan.js";
 import { validateSwingList, swingStatus } from "./swing.js";
 import { WatchMonitor, validateWatchlist, kvGet, kvPut, formatWatchlistAnnouncement, runMonitorTick, watchStatus, armMonitor, setMonitorDeps, sendTelegram, taipeiParts, telegramChatIds } from "./monitor.js";
 import { validatePicksMessage, formatPicksMessage } from "./picks.js";
@@ -23,7 +24,7 @@ import { getInstitutionalTrades, getInstitutionalRanking, getMajorHolders } from
 export { WatchMonitor };
 setMonitorDeps({ getQuotes, getDailyHistory, getMinuteHistory });
 
-const SERVER_INFO = { name: "tw-stock-mcp", version: "0.9.1" };
+const SERVER_INFO = { name: "tw-stock-mcp", version: "0.10.0" };
 const SUPPORTED_PROTOCOLS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
 const INDEX_SYMBOLS = {
@@ -98,6 +99,23 @@ const TOOLS = [
         },
       },
       required: ["symbol"],
+    },
+  },
+  {
+    name: "scan_swing",
+    description:
+      "【波段掃描・伺服器端計算，省 token】一次掃描最多 25 檔（Cloudflare 子請求上限；股票池 50 檔請分兩批）：伺服器自己抓每檔 75 日 K，算好波段策略 v1 的指標後只回傳結果，不需要再用 get_daily_history 逐檔抓 csv。回傳 market（加權指數 IX0001 收盤、20／60 日線、filterOk 大盤濾網是否成立、與 20 日線及 60 日線的差距 %）、setups（符合拉回形態的標的，依 20 日均成交金額排序：trigger 觸發價＝最高＋1 檔、stop＝max（近 5 日最低 − 1 檔，觸發價 − 3×ATR14）、R、stopPct、qty 建議股數（總部位 × riskPct% ÷ R，且不超過 maxPosPct%）、amount、gapLimit 跳空不追價、valid 與 rejectedBy 不成立原因）、rows（每檔一行 csv：見 columns，含 o/h/l/c/v、ma10/ma20/ma60、ma60Up、atr14、turnover20e8 近 20 日均成交金額億元、low5、high75/low75、trend、liquid、pullShape）。v 單位張。includeIndex=false 可省略指數（第二批不用再算）。額度：每檔 1 次歷史行情。",
+    inputSchema: {
+      type: "object",
+      properties: {
+        symbols: { type: "array", items: { type: "string" }, maxItems: 25, description: "股票代號陣列，最多 25 檔" },
+        includeIndex: { type: "boolean", description: "是否一併計算加權指數大盤濾網，預設 true" },
+        totalCapital: { type: "number", description: "股票總部位（元），用來算建議股數，預設 250000" },
+        riskPct: { type: "number", description: "每筆風險佔總部位 %，預設 1" },
+        maxPosPct: { type: "number", description: "單檔市值上限佔總部位 %，預設 20" },
+        holdings: { type: "array", items: { type: "string" }, description: "持股代號，會在 setups 標示 holding（持股不新開倉）" },
+      },
+      required: ["symbols"],
     },
   },
   {
@@ -426,7 +444,7 @@ const TOOLS = [
 ];
 
 // 需要富果金鑰的工具
-const FUGLE_TOOLS = new Set(["get_quotes", "get_intraday_candles", "get_market_overview", "get_daily_history"]);
+const FUGLE_TOOLS = new Set(["get_quotes", "get_intraday_candles", "get_market_overview", "get_daily_history", "scan_swing"]);
 
 // ---------------------------------------------------------------------------
 // 富果 API
@@ -1068,6 +1086,7 @@ const HANDLERS = {
   get_intraday_candles: getIntradayCandles,
   get_market_overview: getMarketOverview,
   get_daily_history: getDailyHistory,
+  scan_swing: (env, args) => scanSwing(args, (symbol, days) => getDailyHistory(env, { symbol, days })),
   get_valuation: getValuation,
   get_margin_trading: getMarginTrading,
   get_daytrade_status: getDaytradeStatus,
@@ -1115,7 +1134,7 @@ async function handleRpc(env, msg) {
         capabilities: { tools: { listChanged: false } },
         serverInfo: SERVER_INFO,
         instructions:
-          "台股行情。富果 API（上市上櫃皆可，每分鐘 60 次額度）：查價、漲跌停與可否現沖用 get_quotes；大盤背景用 get_market_overview；開盤後走勢與量能用 get_intraday_candles；近 N 日量價、振幅、均線用 get_daily_history。證交所 OpenAPI（前一交易日盤後資料，僅上市股票，不吃富果額度）：當沖前先用 get_daytrade_status 確認可否當沖、是否注意／處置；個股融資融券用 get_margin_trading；估值用 get_valuation；全部注意／處置股用 get_alert_lists。籌碼面（免費官方資料，上市上櫃皆可）：個股三大法人買賣超與連買天數用 get_institutional_trades；全市場法人買賣超排行用 get_institutional_ranking；千張大戶持股與週增減用 get_major_holders。注意時段：開盤前或休市日，盤中工具回傳的是最近一個交易日資料，請看 isToday／date。盤中監控：set_daytrade_watchlist 寫入當日當沖條件後，伺服器每數秒自動檢查並以 Telegram 通知（含進場後的停損、第一目標與保本通知）；get_daytrade_watchlist 查看狀態；做空當沖在該檔設 side:\"short\" 並用 priceBelow／invalidAbove。波段盤中通知：set_swing_alerts 寫入持股停損／目標與候選股進場價位（約每 60 秒檢查，價位到了才用 Telegram 通知，持股只送私訊），get_swing_alerts 查看狀態。週選股推播：announce_weekly_picks（新推薦、每日檢查觸發、每日進度、週五週報）。所有工具的個股成交量單位一律為「張」，成交金額為「元」；所有時間為台北時間。",
+          "台股行情。富果 API（上市上櫃皆可，每分鐘 60 次額度）：查價、漲跌停與可否現沖用 get_quotes；大盤背景用 get_market_overview；開盤後走勢與量能用 get_intraday_candles；近 N 日量價、振幅、均線用 get_daily_history；波段策略的大盤濾網、股票池指標與拉回設定用 scan_swing（伺服器端計算，一次 25 檔，比逐檔抓 csv 省很多 token）。證交所 OpenAPI（前一交易日盤後資料，僅上市股票，不吃富果額度）：當沖前先用 get_daytrade_status 確認可否當沖、是否注意／處置；個股融資融券用 get_margin_trading；估值用 get_valuation；全部注意／處置股用 get_alert_lists。籌碼面（免費官方資料，上市上櫃皆可）：個股三大法人買賣超與連買天數用 get_institutional_trades；全市場法人買賣超排行用 get_institutional_ranking；千張大戶持股與週增減用 get_major_holders。注意時段：開盤前或休市日，盤中工具回傳的是最近一個交易日資料，請看 isToday／date。盤中監控：set_daytrade_watchlist 寫入當日當沖條件後，伺服器每數秒自動檢查並以 Telegram 通知（含進場後的停損、第一目標與保本通知）；get_daytrade_watchlist 查看狀態；做空當沖在該檔設 side:\"short\" 並用 priceBelow／invalidAbove。波段盤中通知：set_swing_alerts 寫入持股停損／目標與候選股進場價位（約每 60 秒檢查，價位到了才用 Telegram 通知，持股只送私訊），get_swing_alerts 查看狀態。週選股推播：announce_weekly_picks（新推薦、每日檢查觸發、每日進度、週五週報）。所有工具的個股成交量單位一律為「張」，成交金額為「元」；所有時間為台北時間。",
       });
     }
     case "ping":
