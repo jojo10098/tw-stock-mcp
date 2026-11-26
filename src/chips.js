@@ -4,6 +4,7 @@
  *
  * - 上市三大法人：https://www.twse.com.tw/rwd/zh/fund/T86（每個交易日一份全市場檔）
  * - 上櫃三大法人：https://www.tpex.org.tw（新舊兩種網址，第一次成功後記住用哪一種）
+ * - 三大法人日資料存進 Durable Object（inst:TWSE／inst:TPEX），之後只抓還沒有的日期，避免撞到 subrequest 上限
  * - 集保股權分散：https://opendata.tdcc.com.tw/getOD.ashx?id=1-5（只有最新一週的全市場 CSV）
  *   → 每週把精簡快照存進 Durable Object，之後就能算週增減與近幾週趨勢。
  */
@@ -127,11 +128,24 @@ export function parseInstRows(rows, idx) {
 }
 
 // ---------------------------------------------------------------------------
-// 三大法人：抓取（每日一份全市場資料，isolate 內記憶）
+// 三大法人：抓取（每日一份全市場資料）
+//
+// Cloudflare Workers 每個請求的對外連線（subrequest，含 Durable Object 呼叫、快取命中）有上限
+// （免費方案 50 次）。同一批 JSON-RPC 呼叫共用同一個請求，所以這裡盡量少抓：
+//   1. 已公布的交易日存進 Durable Object（每個市場一個 key），之後只抓還沒有的日期；
+//   2. 只抓「湊滿 days 天」需要的日期，不一次把候選日全抓；
+//   3. 櫃買網址探測失敗就不再逐日重試；
+//   4. 碰到 subrequest 上限立刻停手，且不把這個錯誤記在記憶體裡。
 // ---------------------------------------------------------------------------
 
-const instMemo = new Map(); // "TWSE:2026-11-10" → { ok, map } | { ok:false, reason }
+const instMemo = new Map(); // "TWSE:2026-11-10" → { ok, map } | { ok:false, reason } | { ok:false, error }
 let tpexVariant = null; // 記住哪一種櫃買網址可用
+const INST_KEEP_DAYS = 8; // Durable Object 裡每個市場保留最近幾個交易日（＝days 上限，控制 JSON 大小與 CPU）
+const INST_CACHE_VERSION = 1;
+
+export const isSubrequestLimitError = (msg) => /too many subrequests/i.test(String(msg ?? ""));
+const BUDGET_MSG =
+  "本次請求的對外連線次數已達 Cloudflare 上限（同一批同時呼叫太多工具時會發生），這個市場暫時沒抓；請稍後單獨再呼叫一次";
 
 async function fetchTwseInst(date, today) {
   const ymd = date.replace(/-/g, "");
@@ -193,6 +207,8 @@ async function fetchTpexInst(date, today) {
       }
       errors.push(`${v}: 格式不認得`);
     } catch (e) {
+      // 額度用完時換網址也一樣會失敗，直接往上丟
+      if (isSubrequestLimitError(e.message)) throw e;
       errors.push(`${v}: ${e.message}`);
     }
   }
@@ -212,29 +228,140 @@ async function getInstDay(market, date) {
     r = { ok: false, error: e.message };
   }
   r.at = Date.now();
+  // 額度用完不是資料來源的問題，下一個請求就有新額度，不能記
+  if (r.error && isSubrequestLimitError(r.error)) return r;
   // 過去日期的成功結果不會再變；失敗或今天的結果只記 10 分鐘
   if (instMemo.size > 60) instMemo.clear();
   instMemo.set(key, r);
   return r;
 }
 
-/** 取最近 days 個「有資料」的交易日，兩個市場各自回傳 [{date, map}]（新到舊） */
-async function getInstHistory(days, markets = ["TWSE", "TPEX"]) {
-  const candidates = recentWeekdays(days + 4); // 多抓幾天涵蓋國定假日、今天尚未公布
+// Durable Object 快取格式：{ v, days: { "YYYY-MM-DD": [[代號, 名稱, 外資, 投信, 自營, 合計], ...] }, none: { "YYYY-MM-DD": true } }
+function packInstMap(map) {
+  const rows = [];
+  for (const [code, r] of map) rows.push([code, r.name, r.foreign.net, r.trust.net, r.dealerNet, r.total]);
+  return rows;
+}
+
+function unpackInstRows(rows) {
+  const map = new Map();
+  for (const [code, name, f, t, d, tot] of rows) {
+    map.set(code, { name, foreign: { buy: null, sell: null, net: f }, trust: { buy: null, sell: null, net: t }, dealerNet: d, total: tot });
+  }
+  return map;
+}
+
+function emptyInstCache() {
+  return { v: INST_CACHE_VERSION, days: {}, none: {} };
+}
+
+function pruneInstCache(cache) {
+  const keep = Object.keys(cache.days).sort().reverse().slice(0, INST_KEEP_DAYS);
+  const oldest = keep[keep.length - 1] ?? "";
+  const days = {};
+  for (const d of keep) days[d] = cache.days[d];
+  const none = {};
+  for (const d of Object.keys(cache.none)) if (d >= oldest) none[d] = true;
+  return { v: INST_CACHE_VERSION, days, none };
+}
+
+/**
+ * 取最近 days 個「有資料」的交易日，兩個市場各自回傳 [{date, map}]（新到舊）。
+ * store: { get(key), put(key, value) }（Durable Object KV）；沒有時每次都向來源抓。
+ */
+async function getInstHistory(days, { store = null, markets = ["TWSE", "TPEX"] } = {}) {
+  const today = iso(taipeiDate());
+  const candidates = recentWeekdays(days + 4); // 多幾天涵蓋國定假日、今天尚未公布
   const out = {};
   const errors = {};
+  let budgetHit = false;
+
   for (const market of markets) {
-    // TPEx 先探測一天，確定網址後再平行抓其他天
-    let rest = candidates;
-    const first = market === "TPEX" && !tpexVariant ? [await getInstDay(market, candidates[0])] : [];
-    if (first.length) rest = candidates.slice(1);
-    const results = first.concat(await Promise.all(rest.map((d) => getInstDay(market, d))));
-    const ok = [];
-    results.forEach((r, i) => {
-      if (r.ok) ok.push({ date: candidates[i], map: r.map });
-      else if (r.error) errors[market] = r.error;
-    });
-    out[market] = ok.slice(0, days);
+    out[market] = [];
+    if (budgetHit) {
+      errors[market] = BUDGET_MSG;
+      continue;
+    }
+
+    let cache = null;
+    if (store) {
+      try {
+        const c = await store.get(`inst:${market}`);
+        cache = c && c.v === INST_CACHE_VERSION && c.days && c.none ? c : emptyInstCache();
+      } catch (e) {
+        if (isSubrequestLimitError(e.message)) {
+          budgetHit = true;
+          errors[market] = BUDGET_MSG;
+          continue;
+        }
+        cache = null; // 快取壞了就當沒有，照常向來源抓
+      }
+    }
+    let dirty = false;
+
+    const found = new Map(); // date → map
+    const skip = new Set(); // 已知沒有資料或這次抓失敗的日期
+    for (const d of candidates) {
+      if (cache?.days[d]) found.set(d, unpackInstRows(cache.days[d]));
+      else if (cache?.none[d] && d < today) skip.add(d);
+    }
+
+    let stop = false;
+    while (!stop) {
+      // 由新到舊，只挑「湊滿 days 天」還缺的日期
+      const need = [];
+      let have = 0;
+      for (const d of candidates) {
+        if (have + need.length >= days) break;
+        if (found.has(d)) have++;
+        else if (!skip.has(d)) need.push(d);
+      }
+      if (!need.length) break;
+
+      // 櫃買還不知道哪種網址可用時，先探測一天，確定後再平行抓其他天
+      const batch = market === "TPEX" && !tpexVariant ? need.slice(0, 1) : need;
+      const results = await Promise.all(batch.map((d) => getInstDay(market, d)));
+      results.forEach((r, k) => {
+        const d = batch[k];
+        if (r.ok) {
+          found.set(d, r.map);
+          if (cache) {
+            cache.days[d] = packInstMap(r.map);
+            dirty = true;
+          }
+          return;
+        }
+        skip.add(d);
+        if (r.error) {
+          if (isSubrequestLimitError(r.error)) {
+            budgetHit = true;
+            errors[market] = BUDGET_MSG;
+            stop = true;
+          } else {
+            errors[market] = r.error;
+            // 櫃買三種網址都失敗：其他日期也會失敗，不再逐日重試
+            if (market === "TPEX") stop = true;
+          }
+        } else if (cache && d < today) {
+          cache.none[d] = true; // 過去的平日沒有資料＝休市，不用再查
+          dirty = true;
+        }
+      });
+    }
+
+    out[market] = candidates
+      .filter((d) => found.has(d))
+      .slice(0, days)
+      .map((d) => ({ date: d, map: found.get(d) }));
+
+    if (cache && dirty && !budgetHit) {
+      try {
+        await store.put(`inst:${market}`, pruneInstCache(cache));
+      } catch (e) {
+        if (isSubrequestLimitError(e.message)) budgetHit = true;
+        console.log(JSON.stringify({ instCachePutError: e.message, market }));
+      }
+    }
   }
   return { history: out, errors };
 }
@@ -253,10 +380,10 @@ function streak(values) {
 
 const sum = (arr) => arr.reduce((a, b) => a + (b ?? 0), 0);
 
-export async function getInstitutionalTrades(env, args) {
+export async function getInstitutionalTrades(env, args, store = null) {
   const symbols = symbolList(args);
   const days = Math.min(Math.max(parseInt(args?.days ?? 5, 10) || 5, 1), 8);
-  const { history, errors } = await getInstHistory(days);
+  const { history, errors } = await getInstHistory(days, { store });
 
   const results = symbols.map((symbol) => {
     let market = null;
@@ -308,10 +435,10 @@ export async function getInstitutionalTrades(env, args) {
   };
 }
 
-export async function getInstitutionalRanking(env, args) {
+export async function getInstitutionalRanking(env, args, store = null) {
   const top = Math.min(Math.max(parseInt(args?.top ?? 10, 10) || 10, 1), 30);
   const includeEtf = args?.includeEtf === true;
-  const { history, errors } = await getInstHistory(1);
+  const { history, errors } = await getInstHistory(1, { store });
   const rows = [];
   const dates = {};
   for (const m of ["TWSE", "TPEX"]) {
