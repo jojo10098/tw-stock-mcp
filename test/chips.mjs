@@ -10,6 +10,8 @@ const T86_FIELDS = ["證券代號", "證券名稱", "外陸資買進股數(不�
 const days = recentWeekdays(12);
 const holiday = days[1]; // 假裝第 2 個平日是休市
 let tpexCalls = 0;
+let twseCalls = 0;
+globalThis.TPEX_MODE = "ok"; // ok｜budget（模擬 Cloudflare subrequest 上限）｜down（三種網址都失敗）
 
 function t86Row(code, name, f, t, d) {
   const tot = f + t + d;
@@ -21,6 +23,7 @@ function t86Row(code, name, f, t, d) {
 globalThis.fetch = async (url, init = {}) => {
   const u = new URL(url);
   if (u.hostname === "www.twse.com.tw") {
+    twseCalls++;
     const ymd = u.searchParams.get("date");
     const date = `${ymd.slice(0, 4)}-${ymd.slice(4, 6)}-${ymd.slice(6)}`;
     const i = days.indexOf(date);
@@ -37,6 +40,8 @@ globalThis.fetch = async (url, init = {}) => {
   }
   if (u.hostname === "www.tpex.org.tw") {
     tpexCalls++;
+    if (globalThis.TPEX_MODE === "budget") throw new Error("Too many subrequests by single Worker invocation. To configure this limit, refer to https://developers.cloudflare.com/workers/wrangler/configuration/#limits");
+    if (globalThis.TPEX_MODE === "down") return new Response("down", { status: 500 });
     if (u.pathname.startsWith("/www/") && (init.method ?? "GET") === "GET") return new Response("<html>blocked</html>", { status: 403 });
     if (u.pathname.startsWith("/www/")) {
       // POST 新版：tables[0]，欄位名稱與上市不同
@@ -133,6 +138,67 @@ assert.equal(mh.results[0].weekOverWeek.prevDate, "2026-10-30");
 assert.equal(mh.results[0].weekOverWeek.bigHolder1000PctChange, 0);
 assert.deepEqual(kv.get("tdcc:dates"), ["2026-11-06", "2026-10-30"]);
 console.log("✓ get_major_holders");
+
+// --- 三大法人存進 Durable Object：第二次呼叫只重查還沒公布的今天 ---
+{
+  const ikv = new Map();
+  const istore = { get: async (k) => ikv.get(k) ?? null, put: async (k, v) => ikv.set(k, structuredClone(v)) };
+  const a = await import("../src/chips.js?inst-cache-1");
+  const first = await a.getInstitutionalTrades({}, { symbols: ["2330", "8046"], days: 5 }, istore);
+  assert.equal(first.results[0].daily.length, 5);
+  assert.ok(ikv.get("inst:TWSE") && ikv.get("inst:TPEX"), "兩個市場都寫進快取");
+  assert.ok(ikv.get("inst:TWSE").none[holiday], "休市日記為沒有資料");
+  assert.equal(ikv.get("inst:TWSE").none[days[0]], undefined, "今天還沒公布，不能記成沒有資料");
+
+  const b = await import("../src/chips.js?inst-cache-2"); // 新的 isolate：記憶體清空
+  const tw0 = twseCalls, tp0 = tpexCalls;
+  const second = await b.getInstitutionalTrades({}, { symbols: ["2330", "8046"], days: 5 }, istore);
+  assert.deepEqual(second.results[0].daily, first.results[0].daily, "快取與來源結果相同");
+  assert.deepEqual(second.results[1].daily, first.results[1].daily);
+  assert.equal(second.results[0].foreignStreak, first.results[0].foreignStreak);
+  assert.equal(twseCalls - tw0, 1, `證交所只重查今天（實際 ${twseCalls - tw0} 次）`);
+  assert.ok(tpexCalls - tp0 <= 2, `櫃買只探測今天（實際 ${tpexCalls - tp0} 次）`);
+  const rk = await b.getInstitutionalRanking({}, { top: 5 }, istore);
+  assert.equal(rk.foreignSell[0].code, "2344", "排行可用快取資料");
+  console.log("✓ 三大法人 Durable Object 快取");
+}
+
+// --- 不帶快取時也只抓湊滿天數所需的日期 ---
+{
+  const c = await import("../src/chips.js?inst-minimal");
+  const tw0 = twseCalls;
+  await c.getInstitutionalTrades({}, { symbols: ["2330"], days: 3 });
+  // 今天未公布＋第 2 天休市，所以要抓 5 天才湊滿 3 天；舊版會一次抓 7 天
+  assert.equal(twseCalls - tw0, 5, `證交所呼叫次數 ${twseCalls - tw0}`);
+}
+
+// --- Cloudflare subrequest 上限：不換網址重試、不逐日重試、不記住錯誤 ---
+{
+  const m = await import("../src/chips.js?inst-budget");
+  globalThis.TPEX_MODE = "budget";
+  const tp0 = tpexCalls;
+  const r = await m.getInstitutionalTrades({}, { symbols: ["2330", "8046"], days: 5 });
+  assert.equal(tpexCalls - tp0, 1, `額度用完後只試一次（實際 ${tpexCalls - tp0} 次）`);
+  assert.match(r.sourceErrors.TPEX, /Cloudflare 上限/);
+  assert.equal(r.results[0].market, "上市", "上市資料不受影響");
+  assert.ok(r.results[1].error);
+  globalThis.TPEX_MODE = "ok";
+  const again = await m.getInstitutionalTrades({}, { symbols: ["8046"], days: 2 });
+  assert.equal(again.results[0].market, "上櫃", "下一個請求立刻恢復，不會沿用 10 分鐘前的錯誤");
+  console.log("✓ subrequest 上限處理");
+}
+
+// --- 櫃買三種網址都失敗：只探測一天，不會 3 種 × 每天 ---
+{
+  const m = await import("../src/chips.js?inst-down");
+  globalThis.TPEX_MODE = "down";
+  const tp0 = tpexCalls;
+  const r = await m.getInstitutionalTrades({}, { symbols: ["8046"], days: 5 });
+  assert.equal(tpexCalls - tp0, 3, `櫃買失敗時只探測一天（實際 ${tpexCalls - tp0} 次）`);
+  assert.match(r.sourceErrors.TPEX, /櫃買中心三大法人抓取失敗/);
+  globalThis.TPEX_MODE = "ok";
+  console.log("✓ 櫃買故障不逐日重試");
+}
 
 function r(x) {
   return Math.round(x * 100) / 100;

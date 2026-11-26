@@ -25,7 +25,7 @@ import { getInstitutionalTrades, getInstitutionalRanking, getMajorHolders } from
 export { WatchMonitor };
 setMonitorDeps({ getQuotes, getDailyHistory, getMinuteHistory });
 
-const SERVER_INFO = { name: "tw-stock-mcp", version: "0.11.0" };
+const SERVER_INFO = { name: "tw-stock-mcp", version: "0.11.1" };
 const SUPPORTED_PROTOCOLS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
 const INDEX_SYMBOLS = {
@@ -1142,12 +1142,12 @@ const HANDLERS = {
   get_swing_alerts: getSwingAlerts,
   announce_weekly_picks: announceWeeklyPicks,
   announce_market_events: announceMarketEvents,
-  get_institutional_trades: getInstitutionalTrades,
-  get_institutional_ranking: getInstitutionalRanking,
+  get_institutional_trades: (env, args) => getInstitutionalTrades(env, args, chipStore(env)),
+  get_institutional_ranking: (env, args) => getInstitutionalRanking(env, args, chipStore(env)),
   get_major_holders: (env, args) => getMajorHolders(env, args, chipStore(env)),
 };
 
-// 集保週快照存在 Durable Object（與盤中監控共用）；沒有綁定時只能回最新一週
+// 集保週快照、三大法人日資料存在 Durable Object（與盤中監控共用）；沒有綁定時每次向來源抓
 function chipStore(env) {
   return env.MONITOR ? { get: (k) => kvGet(env, k), put: (k, v) => kvPut(env, k, v) } : null;
 }
